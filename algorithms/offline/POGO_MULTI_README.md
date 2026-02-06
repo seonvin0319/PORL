@@ -5,11 +5,58 @@ POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 mul
 ## 주요 특징
 
 - **각 알고리즘의 구조를 그대로 사용**: Critic, V function, Q function 등은 각 알고리즘(IQL, CQL, TD3_BC 등)의 원래 구조 유지
+- **Critic 업데이트는 원래 알고리즘의 actor만 사용**: 모든 알고리즘에서 Critic/V/Q 업데이트는 기존 방식 그대로
 - **Actor만 multi-actor로 교체**: Actor 개수와 Actor loss만 변경
+- **Policy loss에서만 multi-actor 학습**: Critic은 기존 방식 그대로, Actor만 multi-actor로 확장
 - **Config에서 algorithm 선택**: `algorithm: iql` 또는 `algorithm: td3_bc` 등으로 선택
 - **Multi-Actor 구조**: 여러 actor를 순차적으로 학습하는 JKO chain 방식
-- **Actor0**: W2 (Wasserstein-2) distance를 사용하여 dataset action과의 L2 loss로 학습
-- **Actor1+**: Sinkhorn distance를 사용하여 이전 actor와의 거리로 학습
+- **Actor0**: 각 알고리즘의 원래 actor loss만 사용 (W2 penalty 없음)
+- **Actor1+**: 각 알고리즘의 actor loss + W2 distance to previous actor (`w2_weights` 리스트 사용)
+- **JAX/PyTorch 양쪽 구현**: 동일한 구조와 로직을 따르는 두 가지 구현 제공
+
+## Policy 타입
+
+### GaussianMLP
+- **Mean**: `tanh(...) * max_action` (bounded mean)
+- **Sampling**: bounded mean과 std로부터 Gaussian 샘플링
+- **W2 Distance**: Closed-form W2 사용 (`||μ1-μ2||² + ||σ1-σ2||²`)
+- **속성**: `is_gaussian=True`, `is_stochastic=True`
+
+### TanhGaussianMLP
+- **Mean**: Unbounded
+- **Sampling**: Unbounded Gaussian에서 샘플링 후 `tanh` 적용
+- **W2 Distance**: Sinkhorn distance 사용 (closed-form W2 사용 불가)
+- **속성**: `is_gaussian=False`, `is_stochastic=True`
+
+### StochasticMLP
+- **Sampling**: Latent `z` 벡터 사용
+- **W2 Distance**: Sinkhorn distance 사용
+- **속성**: `is_gaussian=False`, `is_stochastic=True`
+
+### DeterministicMLP
+- **Output**: 단일 deterministic action
+- **W2 Distance**: L2 distance 사용
+- **속성**: `is_gaussian=False`, `is_stochastic=False`
+
+## 코드 구조
+
+### 핵심 컴포넌트
+
+1. **`ActorConfig` dataclass**: Actor 관련 정보를 그룹화
+   ```python
+   @dataclass
+   class ActorConfig:
+       actor: nn.Module  # PyTorch
+       # 또는 params: FrozenDict, module: nn.Module  # JAX
+       is_stochastic: bool
+       is_gaussian: bool
+   ```
+
+2. **공통 헬퍼 함수**:
+   - `_compute_w2_distance()`: Policy 타입에 따라 자동으로 적절한 W2 계산 방법 선택
+   - `_compute_actor_loss_with_w2()`: Actor0/Actor1+ loss 계산 통합
+
+3. **Policy 타입 자동 감지**: Policy 클래스의 `is_gaussian`, `is_stochastic` 속성 자동 사용
 
 ## 설치
 
@@ -21,27 +68,33 @@ POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 mul
 pip install geomloss PyYAML
 ```
 
-또는 `requirements.txt`를 업데이트했습니다:
-
+JAX 버전 사용 시:
 ```bash
-pip install -r requirements/requirements.txt
+pip install jax jaxlib flax optax ott-jax
 ```
 
 ## 사용 방법
 
-### IQL 구조로 multi-actor 학습
+### PyTorch 버전
 
+#### IQL 구조로 multi-actor 학습
 ```bash
 cd /home/offrl/CORL
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_iql.yaml
 ```
 
-### TD3_BC 구조로 multi-actor 학습
-
+#### TD3_BC 구조로 multi-actor 학습
 ```bash
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_td3_bc.yaml
+```
+
+### JAX 버전 (ReBRAC 기반)
+
+```bash
+python -m algorithms.offline.pogo_multi_jax \
+    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_rebrac.yaml
 ```
 
 ### Command-line 인자로 override
@@ -52,7 +105,7 @@ python -m algorithms.offline.pogo_multi_main \
     --algorithm iql \
     --max_timesteps 1000000 \
     --eval_freq 5000 \
-    --w2_weights 10.0 10.0 10.0
+    --w2_weights 10.0 10.0
 ```
 
 ## Config 파일 구조
@@ -71,10 +124,17 @@ n_episodes: 10
 max_timesteps: 1000000
 
 # POGO Multi-Actor 설정
-w2_weights: [10.0, 10.0, 10.0]
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+w2_weights: [10.0, 10.0]  # Actor1, Actor2용
 num_actors: 3
 
-# Sinkhorn 설정 (Actor1+용)
+# Actor 타입 설정 (선택사항)
+actor_configs:
+  - type: gaussian      # Actor0: Gaussian (closed-form W2)
+  - type: tanh_gaussian # Actor1: TanhGaussian (Sinkhorn)
+  - type: stochastic    # Actor2: Stochastic (Sinkhorn)
+
+# Sinkhorn 설정 (Actor1+용, Gaussian이 아닌 경우에만 사용)
 sinkhorn_K: 4
 sinkhorn_blur: 0.05
 sinkhorn_backend: "tensorized"
@@ -100,28 +160,29 @@ group: pogo-multi-iql
 name: pogo-multi-iql
 ```
 
-### TD3_BC 구조 예시
+### JAX 버전 (ReBRAC) 예시
 
 ```yaml
-# 필수: 사용할 알고리즘 선택
-algorithm: td3_bc
+# ReBRAC 기본 설정
+dataset_name: halfcheetah-medium-v2
+actor_learning_rate: 1e-3
+critic_learning_rate: 1e-3
+hidden_dim: 256
+gamma: 0.99
+tau: 5e-3
+beta: 1.0
 
-env: halfcheetah-medium-v2
-w2_weights: [10.0, 10.0, 10.0]
+# POGO Multi-Actor 설정
+w2_weights: [10.0, 10.0]
+num_actors: 3
+actor_configs:
+  - type: deterministic
+  - type: gaussian
+  - type: tanh_gaussian
 
-# TD3_BC 파라미터 (TD3_BC 구조 그대로 사용)
-alpha: 2.5
-policy_noise: 0.2
-noise_clip: 0.5
-policy_freq: 2
-qf_lr: 3e-4
-actor_lr: 3e-4
-
-# 공통 파라미터
-batch_size: 256
-discount: 0.99
-tau: 0.005
-...
+# Sinkhorn 설정
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
 ```
 
 ## 알고리즘 구조
@@ -135,123 +196,64 @@ tau: 0.005
    - AWAC: Twin Critic + Advantage-weighted BC
    - SAC-N: Vectorized Critic (ensemble) + SAC-style actor
    - EDAC: Vectorized Critic (ensemble) + diversity loss + SAC-style actor
+   - ReBRAC (JAX): Ensemble Critic + TD3-style actor
    - 각 알고리즘의 Critic, V, Q 구조는 변경 없음
 
-2. **Actor만 multi-actor로 교체**
-   - 모든 알고리즘에서 POGO policies (StochasticMLP/DeterministicMLP) 사용
+2. **Critic 업데이트는 원래 알고리즘의 actor만 사용**
+   - 모든 알고리즘에서 Critic/V/Q 업데이트는 기존 방식 그대로
+   - IQL: V, Q 업데이트는 기존 IQL 방식 그대로 (Actor0는 호환성용으로만 연결)
+   - CQL: Q loss 계산은 원래 TanhGaussianPolicy 사용 (CQL의 `_q_loss` 메서드 그대로)
+   - TD3_BC, AWAC, SAC-N, EDAC: Critic 업데이트는 각 알고리즘의 원래 방식 그대로
+   - ReBRAC: Critic 업데이트는 Actor0만 사용
+
+3. **Actor만 multi-actor로 교체 (Policy loss에서만)**
+   - 모든 알고리즘에서 POGO policies 사용
    - Actor 개수: config에서 지정 (예: 3개)
-   - Actor loss만 변경
+   - Actor loss만 변경: Multi-actor 학습은 Policy loss에서만 수행
 
 ### Actor 학습 방식
 
-#### IQL + Multi-Actor
+#### Actor0 (W2 penalty 없음)
+- 각 알고리즘의 원래 actor loss만 사용
+- IQL: `mean(exp(β·adv) · ||π₀(s) - a_dataset||²)`
+- TD3_BC: `-λ·Q(s, π₀(s)) + ||π₀(s) - a_dataset||²`
+- CQL: `CQL_policy_loss`
+- AWAC: `mean(weights · BC_loss)`
+- SAC-N/EDAC: `(α·log_π - Q_min)`
+- ReBRAC: `(β·BC_penalty - λ·Q)`
 
-1. **Base IQL의 V, Q 업데이트** (그대로):
-   - V function: `V(s) = expectile(Q(s, a_dataset), τ)`
-   - Q function: `Q(s, a) = r + γ·V(s')`
-
-2. **Actor0**:
-   - Loss: `mean(exp(β·adv) · ||π₀(s) - a_dataset||²) + w₂₀ · ||π₀(s) - a_dataset||²`
-   - IQL의 advantage-weighted BC loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `-Q(s, πᵢ(s)) + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - Q 최대화 + 이전 actor와의 Sinkhorn distance
-
-#### CQL + Multi-Actor
-
-1. **Base CQL의 Q loss 계산** (그대로):
-   - CQL의 원래 `_q_loss` 메서드 사용
-   - OOD action 샘플링, logsumexp, CQL penalty 모두 포함
-   - TanhGaussianPolicy 사용 (Q loss 계산용)
-
-2. **Actor0**:
-   - Loss: `CQL_policy_loss + w₂₀ · ||π₀(s) - a_dataset||²`
-   - CQL의 원래 policy loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `CQL_policy_loss + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - CQL의 원래 policy loss + Sinkhorn distance
-
-#### AWAC + Multi-Actor
-
-1. **Base AWAC의 Critic 업데이트** (그대로):
-   - Twin Q-network: `Q1, Q2 = AWAC_critic(s, a)`
-   - Target: `r + γ·min(Q1(s', a'), Q2(s', a'))`
-
-2. **Actor0**:
-   - Loss: `mean(weights · BC_loss) + w₂₀ · ||π₀(s) - a_dataset||²`
-   - AWAC의 advantage-weighted BC loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `-Q(s, πᵢ(s)) + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - Q 최대화 + Sinkhorn distance
-
-#### SAC-N + Multi-Actor
-
-1. **Base SAC-N의 Alpha, Critic 업데이트** (그대로):
-   - Alpha: adaptive entropy coefficient
-   - Vectorized Critic: ensemble of Q-networks (여러 critic)
-   - Critic loss: `MSE(Q_ensemble, target_Q)`
-
-2. **Actor0**:
-   - Loss: `(α·log_π - Q_min) + w₂₀ · ||π₀(s) - a_dataset||²`
-   - SAC-N의 원래 actor loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `(α·log_π - Q_min) + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - SAC-N의 원래 actor loss + Sinkhorn distance
-
-#### EDAC + Multi-Actor
-
-1. **Base EDAC의 Alpha, Critic 업데이트** (그대로):
-   - Alpha: adaptive entropy coefficient
-   - Vectorized Critic: ensemble of Q-networks
-   - Critic loss: `MSE(Q_ensemble, target_Q) + η·diversity_loss`
-   - Diversity loss: critic 간 gradient diversity 유지
-
-2. **Actor0**:
-   - Loss: `(α·log_π - Q_min) + w₂₀ · ||π₀(s) - a_dataset||²`
-   - EDAC의 원래 actor loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `(α·log_π - Q_min) + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - EDAC의 원래 actor loss + Sinkhorn distance
-
-#### TD3_BC + Multi-Actor
-
-1. **Base TD3_BC의 Critic 업데이트** (그대로):
-   - Twin Q-network: `Q1, Q2 = TD3_critic(s, a)`
-   - Target: `r + γ·min(Q1(s', a'), Q2(s', a'))`
-
-2. **Actor0**:
-   - Loss: `-λ·Q(s, π₀(s)) + ||π₀(s) - a_dataset||² + w₂₀ · ||π₀(s) - a_dataset||²`
-   - TD3_BC loss + W2 distance
-
-3. **Actor1+**:
-   - Loss: `-λ·Q(s, πᵢ(s)) + w₂ᵢ · Sinkhorn(πᵢ(·|s), πᵢ₋₁(·|s))`
-   - TD3_BC loss + Sinkhorn distance
+#### Actor1+ (W2 penalty 추가)
+- 각 알고리즘의 actor loss + W2 distance to previous actor
+- W2 distance 계산:
+  - **Both Gaussian**: Closed-form W2 (`||μ1-μ2||² + ||σ1-σ2||²`)
+  - **Both Stochastic (not Gaussian)**: Sinkhorn distance
+  - **At least one Deterministic**: L2 distance
+- Loss: `base_loss + w2_weight_i * w2_distance`
 
 ## Config 파라미터 설명
 
 ### 필수 파라미터
 
-- `algorithm`: 사용할 알고리즘 선택 (필수)
+- `algorithm`: 사용할 알고리즘 선택 (PyTorch 버전, 필수)
   - `"iql"`: IQL 구조 사용 (V function + Q function)
   - `"td3_bc"`: TD3_BC 구조 사용 (Twin Critic)
-  - `"cql"`: CQL 구조 사용 (Conservative Q-learning, 원래 Q loss 그대로 사용)
+  - `"cql"`: CQL 구조 사용 (Conservative Q-learning)
   - `"awac"`: AWAC 구조 사용 (Twin Critic + Advantage-weighted BC)
   - `"sac_n"`: SAC-N 구조 사용 (Vectorized Critic ensemble)
   - `"edac"`: EDAC 구조 사용 (Vectorized Critic ensemble + diversity loss)
 
 ### POGO Multi-Actor 전용 파라미터
 
-- `w2_weights`: 각 actor의 W2/Sinkhorn loss 가중치 리스트
-- `num_actors`: Actor 개수 (None이면 `len(w2_weights)` 사용)
-- `actor_configs`: 각 actor의 설정 리스트 (예: `[{"deterministic": false}, ...]`)
+- `w2_weights`: Actor1부터의 W2/Sinkhorn loss 가중치 리스트 (Actor0는 W2 penalty 없음)
+  - 예: `[10.0, 10.0]` → Actor1, Actor2용
+  - `num_actors = len(w2_weights) + 1` (자동 계산)
+- `num_actors`: Actor 개수 (None이면 `len(w2_weights) + 1` 사용)
+- `actor_configs`: 각 actor의 설정 리스트
+  - `type`: `"gaussian"`, `"tanh_gaussian"`, `"stochastic"`, `"deterministic"`
+  - 예: `[{"type": "gaussian"}, {"type": "tanh_gaussian"}, {"type": "stochastic"}]`
 - `sinkhorn_K`: Sinkhorn 계산 시 각 state당 샘플 수
 - `sinkhorn_blur`: Sinkhorn regularization parameter (epsilon)
-- `sinkhorn_backend`: Sinkhorn backend ("tensorized", "online", "auto")
+- `sinkhorn_backend`: Sinkhorn backend (`"tensorized"`, `"online"`, `"auto"`)
 
 ### 알고리즘별 파라미터
 
@@ -263,6 +265,7 @@ tau: 0.005
 - **AWAC**: `awac_lambda`, `exp_adv_max`, `actor_lr`
 - **SAC-N**: `num_critics`, `alpha_learning_rate`, `actor_lr`
 - **EDAC**: `num_critics`, `eta`, `alpha_learning_rate`, `actor_lr`
+- **ReBRAC (JAX)**: `actor_learning_rate`, `critic_learning_rate`, `beta`, `gamma`, `tau`, `policy_noise`, `noise_clip`, `normalize_q`
 
 ## 평가
 
@@ -274,12 +277,16 @@ tau: 0.005
 
 ```
 algorithms/offline/
-├── pogo_multi_main.py          # 통합 학습 스크립트 (각 알고리즘 선택 가능)
-├── pogo_policies.py            # POGO policies (StochasticMLP, DeterministicMLP)
-├── pogo_multi.py               # 이전 구현 (참조용)
+├── pogo_multi_main.py          # PyTorch 통합 학습 스크립트
+├── pogo_multi_jax.py            # JAX 통합 학습 스크립트 (ReBRAC 기반)
+├── pogo_policies.py             # POGO policies (GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP)
 ├── iql.py                      # IQL (그대로 사용)
 ├── td3_bc.py                   # TD3_BC (그대로 사용)
 ├── cql.py                      # CQL (그대로 사용)
+├── awac.py                     # AWAC (그대로 사용)
+├── sac_n.py                    # SAC-N (그대로 사용)
+├── edac.py                     # EDAC (그대로 사용)
+├── rebrac.py                   # ReBRAC (JAX, 그대로 사용)
 ├── POGO_MULTI_README.md        # 이 파일
 └── POGO_MULTI_ARCHITECTURE.md  # 아키텍처 상세 설명
 
@@ -291,70 +298,59 @@ configs/offline/pogo_multi/
 │   ├── medium_v2_awac.yaml     # algorithm: awac
 │   ├── medium_v2_sac_n.yaml    # algorithm: sac_n
 │   ├── medium_v2_edac.yaml     # algorithm: edac
+│   ├── medium_v2_rebrac.yaml   # JAX ReBRAC
 │   └── ...
 └── ...
 ```
 
-## 참고
+## 코드 구조 개선 사항
 
-- **POGO_sv**: `/home/offrl/POGO_sv` - 원본 baseline 프로젝트
-- **CORL**: 이 프로젝트가 통합된 프레임워크
-- **GeomLoss**: Sinkhorn distance 계산을 위한 라이브러리
+### 1. Policy 타입 자동 관리
+- 모든 Policy 클래스에 `is_gaussian`, `is_stochastic` 속성 자동 설정
+- `_create_multi_actors`에서 자동으로 속성 읽기
+
+### 2. ActorConfig dataclass
+- Actor 관련 정보를 논리적으로 그룹화
+- JAX와 PyTorch 버전 모두 동일한 구조 사용
+
+### 3. 공통 헬퍼 함수
+- `_compute_w2_distance()`: Policy 타입에 따라 자동으로 적절한 방법 선택
+- `_compute_actor_loss_with_w2()`: Actor0/Actor1+ loss 계산 통합
+- 코드 중복 제거 및 유지보수성 향상
+
+### 4. 알고리즘 인터페이스 (JAX)
+- `AlgorithmInterface`: 다른 알고리즘으로 확장 가능한 인터페이스 정의
+- `ReBRACAlgorithm`: ReBRAC 구현체
 
 ## 예시 실행
 
-### IQL 구조로 multi-actor 학습
+### PyTorch 버전
 
 ```bash
+# IQL 구조로 multi-actor 학습
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_iql.yaml
-```
 
-### TD3_BC 구조로 multi-actor 학습
-
-```bash
+# TD3_BC 구조로 multi-actor 학습
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_td3_bc.yaml
-```
 
-### CQL 구조로 multi-actor 학습
-
-```bash
-python -m algorithms.offline.pogo_multi_main \
-    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_cql.yaml
-```
-
-### AWAC 구조로 multi-actor 학습
-
-```bash
-python -m algorithms.offline.pogo_multi_main \
-    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_awac.yaml
-```
-
-### SAC-N 구조로 multi-actor 학습
-
-```bash
-python -m algorithms.offline.pogo_multi_main \
-    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_sac_n.yaml
-```
-
-### EDAC 구조로 multi-actor 학습
-
-```bash
-python -m algorithms.offline.pogo_multi_main \
-    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_edac.yaml
-```
-
-### Custom 설정으로 실행
-
-```bash
+# Custom 설정으로 실행
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_iql.yaml \
     --algorithm iql \
-    --w2_weights 20.0 20.0 20.0 \
+    --w2_weights 20.0 20.0 \
     --sinkhorn_K 8 \
     --sinkhorn_blur 0.1 \
     --max_timesteps 2000000
+```
+
+### JAX 버전
+
+```bash
+# ReBRAC 구조로 multi-actor 학습
+python -m algorithms.offline.pogo_multi_jax \
+    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_rebrac.yaml
 ```
 
 ## 문제 해결
@@ -369,6 +365,12 @@ python -m algorithms.offline.pogo_multi_main \
 pip install geomloss
 ```
 
+### JAX 관련 에러
+
+```bash
+pip install jax jaxlib flax optax ott-jax
+```
+
 ### CUDA/Display 에러
 
 Headless 환경에서는:
@@ -376,6 +378,13 @@ Headless 환경에서는:
 export MUJOCO_GL=egl
 export D4RL_SUPPRESS_IMPORT_ERROR=1
 ```
+
+## 참고
+
+- **POGO_sv**: 원본 baseline 프로젝트
+- **CORL**: 이 프로젝트가 통합된 프레임워크
+- **GeomLoss**: Sinkhorn distance 계산을 위한 라이브러리 (PyTorch)
+- **OTT-JAX**: Optimal Transport Tools for JAX (JAX 버전)
 
 ## 라이센스
 

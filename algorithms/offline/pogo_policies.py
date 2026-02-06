@@ -66,6 +66,8 @@ class BaseActor(nn.Module):
 class StochasticMLP(BaseActor):
     def __init__(self, state_dim, action_dim, max_action):
         super().__init__(state_dim, action_dim, max_action)
+        self.is_gaussian = False
+        self.is_stochastic = True
         self.l1 = nn.Linear(state_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.head = nn.Linear(256, action_dim)
@@ -101,11 +103,188 @@ class StochasticMLP(BaseActor):
         return action_tensor.cpu().numpy().flatten()
 
 
+class GaussianMLP(nn.Module):
+    """Gaussian Policy: mean에 tanh가 적용된 상태에서 샘플링
+    mean = tanh(...) * max_action (bounded mean)
+    그 mean, std로 Gaussian 샘플링
+    Closed form W2 distance 사용 가능
+    """
+    LOG_STD_MIN = -20.0
+    LOG_STD_MAX = 2.0
+
+    def __init__(self, state_dim, action_dim, max_action):
+        super().__init__()
+        self.action_dim = action_dim
+        self.max_action = max_action
+        self.is_gaussian = True  # Closed form W2 사용 가능
+        self.is_stochastic = True
+        self.l1 = nn.Linear(state_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.head = nn.Linear(256, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
+
+    def forward(self, states):
+        """Forward pass: state -> mean (with tanh)"""
+        x = F.relu(self.l1(states))
+        x = F.relu(self.l2(x))
+        mean = torch.tanh(self.head(x)) * self.max_action
+        return mean
+
+    def get_mean_std(self, states):
+        """Get mean and std: (mean, std)
+        mean은 이미 tanh space에 있음 (bounded)
+        """
+        mean = self.forward(states)
+        log_std = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = torch.exp(log_std)
+        # Broadcast std to batch size
+        std = std.unsqueeze(0).expand(mean.size(0), -1)
+        return mean, std
+
+    @torch.no_grad()
+    def deterministic_actions(self, states):
+        """Deterministic action: mean"""
+        return self.forward(states)
+
+    def sample_actions(self, states, K: int = 1, seed: Optional[int] = None):
+        """Sample K actions: [B, K, action_dim]
+        mean에 tanh가 적용된 상태에서 샘플링
+        """
+        mean, std = self.get_mean_std(states)  # [B, action_dim]
+        B = states.size(0)
+        
+        # Sample noise
+        if seed is None:
+            noise = torch.randn(B, K, self.action_dim, device=states.device, dtype=states.dtype)
+        else:
+            g = torch.Generator(device=states.device)
+            g.manual_seed(seed)
+            noise = torch.randn(B, K, self.action_dim, device=states.device, dtype=states.dtype, generator=g)
+        
+        # Expand mean and std: [B, K, action_dim]
+        mean_expanded = mean.unsqueeze(1).expand(B, K, self.action_dim)
+        std_expanded = std.unsqueeze(1).expand(B, K, self.action_dim)
+        
+        # Sample actions (mean은 이미 bounded)
+        actions = mean_expanded + std_expanded * noise
+        actions = torch.clamp(actions, -self.max_action, self.max_action)
+        return actions
+
+    def __call__(self, states, *args, **kwargs):
+        """AWAC 등과 호환: (states) -> (action, log_prob)"""
+        if len(args) == 0 and len(kwargs) == 0:
+            # states만 전달된 경우 (AWAC 등)
+            action = self.deterministic_actions(states)
+            # log_prob는 0으로 반환 (간단화)
+            log_prob = torch.zeros(action.size(0), device=action.device)
+            return action, log_prob
+        else:
+            # 원래 forward 호출
+            return super().__call__(states, *args, **kwargs)
+
+    @torch.no_grad()
+    def act(self, state: np.ndarray, device: str = "cpu"):
+        """CORL 알고리즘과 호환되는 act 메서드"""
+        state_tensor = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
+        action_tensor = self.deterministic_actions(state_tensor)
+        return action_tensor.cpu().numpy().flatten()
+
+
+class TanhGaussianMLP(nn.Module):
+    """TanhGaussian Policy: unbounded Gaussian에서 샘플링 후 tanh 적용
+    mean = ... (unbounded)
+    mean, std로 Gaussian 샘플링 (unbounded space)
+    그 다음 tanh를 적용하여 bounded로 만듦
+    Closed form W2 사용 불가 (Sinkhorn 사용)
+    """
+    LOG_STD_MIN = -20.0
+    LOG_STD_MAX = 2.0
+
+    def __init__(self, state_dim, action_dim, max_action):
+        super().__init__()
+        self.action_dim = action_dim
+        self.max_action = max_action
+        self.is_gaussian = False  # TanhGaussian은 closed form W2 사용 불가
+        self.is_stochastic = True
+        self.l1 = nn.Linear(state_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.head = nn.Linear(256, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
+
+    def forward(self, states):
+        """Forward pass: state -> mean (unbounded)"""
+        x = F.relu(self.l1(states))
+        x = F.relu(self.l2(x))
+        mean = self.head(x)  # Unbounded
+        return mean
+
+    def get_mean_std(self, states):
+        """Get mean and std: (mean, std)
+        mean은 unbounded space에 있음
+        """
+        mean = self.forward(states)
+        log_std = self.log_std.clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        std = torch.exp(log_std)
+        # Broadcast std to batch size
+        std = std.unsqueeze(0).expand(mean.size(0), -1)
+        return mean, std
+
+    @torch.no_grad()
+    def deterministic_actions(self, states):
+        """Deterministic action: tanh(mean) * max_action"""
+        mean = self.forward(states)
+        return torch.tanh(mean) * self.max_action
+
+    def sample_actions(self, states, K: int = 1, seed: Optional[int] = None):
+        """Sample K actions: [B, K, action_dim]
+        unbounded Gaussian에서 샘플링 후 tanh 적용
+        """
+        mean, std = self.get_mean_std(states)  # [B, action_dim]
+        B = states.size(0)
+        
+        # Sample noise
+        if seed is None:
+            noise = torch.randn(B, K, self.action_dim, device=states.device, dtype=states.dtype)
+        else:
+            g = torch.Generator(device=states.device)
+            g.manual_seed(seed)
+            noise = torch.randn(B, K, self.action_dim, device=states.device, dtype=states.dtype, generator=g)
+        
+        # Expand mean and std: [B, K, action_dim]
+        mean_expanded = mean.unsqueeze(1).expand(B, K, self.action_dim)
+        std_expanded = std.unsqueeze(1).expand(B, K, self.action_dim)
+        
+        # Sample actions from unbounded Gaussian
+        actions_unbounded = mean_expanded + std_expanded * noise
+        
+        # Apply tanh to make bounded
+        actions = torch.tanh(actions_unbounded) * self.max_action
+        return actions
+
+    def __call__(self, states, *args, **kwargs):
+        """AWAC 등과 호환: (states) -> (action, log_prob)"""
+        if len(args) == 0 and len(kwargs) == 0:
+            action = self.deterministic_actions(states)
+            log_prob = torch.zeros(action.size(0), device=action.device)
+            return action, log_prob
+        else:
+            return super().__call__(states, *args, **kwargs)
+
+    @torch.no_grad()
+    def act(self, state: np.ndarray, device: str = "cpu"):
+        """CORL 알고리즘과 호환되는 act 메서드"""
+        state_tensor = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
+        action_tensor = self.deterministic_actions(state_tensor)
+        return action_tensor.cpu().numpy().flatten()
+
+
 class DeterministicMLP(nn.Module):
     def __init__(self, state_dim, action_dim, max_action):
         super().__init__()
         self.action_dim = action_dim
         self.max_action = max_action
+        self.is_gaussian = False
+        self.is_stochastic = False
         self.l1 = nn.Linear(state_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.head = nn.Linear(256, action_dim)

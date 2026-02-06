@@ -10,7 +10,8 @@ n_episodes: 10
 max_timesteps: 1000000
 
 # POGO Multi-Actor
-w2_weights: [0.0, 10.0, 10.0]
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+w2_weights: [10.0, 10.0]
 num_actors: 3
 
 # Sinkhorn

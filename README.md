@@ -9,19 +9,31 @@ POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 mul
 ### 핵심 원칙
 
 - ✅ **각 알고리즘의 Critic, V, Q 구조는 변경 없음**
+- ✅ **Critic 업데이트는 원래 알고리즘의 actor만 사용** (모든 알고리즘 공통)
 - ✅ **Actor만 multi-actor로 교체** (개수와 loss만 변경)
+- ✅ **Policy loss에서만 multi-actor 학습** (Critic은 기존 방식 그대로)
 - ✅ **Config에서 algorithm 선택 가능** (`algorithm: iql`, `td3_bc`, `cql`, `awac`, `sac_n`, `edac`)
 - ✅ **기존 알고리즘 파일은 전혀 수정하지 않음**
+- ✅ **JAX/PyTorch 양쪽 구현**: 동일한 구조와 로직을 따르는 두 가지 구현 제공
+- ✅ **Policy 타입 자동 관리**: `is_gaussian`, `is_stochastic` 속성 자동 감지
+- ✅ **코드 구조 개선**: `ActorConfig` dataclass, 공통 헬퍼 함수로 중복 제거
 
 ## 주요 특징
 
 ### Multi-Actor 구조
 
-- **Actor0**: W2 (Wasserstein-2) distance를 사용하여 dataset action과의 L2 loss로 학습
-  - `w2_weight[0] = 0` (현재 설정: actor0는 기존 알고리즘)
-- **Actor1+**: Sinkhorn distance를 사용하여 이전 actor와의 분포 거리로 학습
-  - `w2_weight[1] = 10.0` (일반 환경), `100.0` (expert 환경)
-  - `w2_weight[2] = 10.0` (일반 환경), `100.0` (expert 환경)
+**학습 방식:**
+- **Critic 업데이트**: 모든 알고리즘에서 원래 알고리즘의 actor만 사용
+  - IQL: V, Q 업데이트는 기존 IQL 방식 그대로
+  - CQL: Q loss 계산은 원래 TanhGaussianPolicy 사용 (CQL의 `_q_loss` 메서드 그대로)
+  - TD3_BC, AWAC, SAC-N, EDAC: Critic 업데이트는 각 알고리즘의 원래 방식 그대로
+- **Actor 업데이트**: Multi-actor 학습은 Policy loss에서만 수행
+  - **Actor0**: 각 알고리즘의 원래 actor loss만 사용 (W2 penalty 없음)
+  - **Actor1+**: 각 알고리즘의 actor loss + W2 distance to previous actor (`w2_weights` 리스트 사용)
+    - W2 distance 계산 방법:
+      - **Both Gaussian**: Closed-form W2 (`||μ1-μ2||² + ||σ1-σ2||²`)
+      - **Both Stochastic (not Gaussian)**: Sinkhorn distance
+      - **At least one Deterministic**: L2 distance
 
 ### 지원 알고리즘
 
@@ -75,6 +87,7 @@ conda activate offrl
 
 ### 1. 단일 환경 학습
 
+#### PyTorch 버전
 ```bash
 # IQL 구조로 multi-actor 학습
 python -m algorithms.offline.pogo_multi_main \
@@ -83,6 +96,13 @@ python -m algorithms.offline.pogo_multi_main \
 # 다른 알고리즘 예시
 python -m algorithms.offline.pogo_multi_main \
     --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_awac.yaml
+```
+
+#### JAX 버전
+```bash
+# ReBRAC 구조로 multi-actor 학습
+python -m algorithms.offline.pogo_multi_jax \
+    --config_path configs/offline/pogo_multi/halfcheetah/medium_v2_rebrac.yaml
 ```
 
 ### 2. 전체 환경 순차 학습 (IQL)
@@ -104,8 +124,10 @@ bash run_iql_all_envs.sh
 9. walker2d-medium-replay-v2
 
 **Weights 설정:**
-- 일반 환경: `[0.0, 10.0, 10.0]` (actor0=0, actor1/2만 적용)
-- Expert 환경: `[0.0, 100.0, 100.0]` (actor0=0, actor1/2는 10배)
+- 일반 환경: `[10.0, 10.0]` (Actor1, Actor2용, Actor0는 W2 penalty 없음)
+- Expert 환경: `[100.0, 100.0]` (Actor1, Actor2용, 일반 환경의 10배)
+
+**참고**: `w2_weights`는 Actor1부터 시작하므로, `num_actors = len(w2_weights) + 1`입니다.
 
 ## Config 파일 구조
 
@@ -123,7 +145,8 @@ n_episodes: 10
 max_timesteps: 1000000
 
 # POGO Multi-Actor 설정
-w2_weights: [0.0, 10.0, 10.0]  # actor0=0, actor1/2만 적용
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+w2_weights: [10.0, 10.0]  # Actor1, Actor2용
 num_actors: 3
 
 # Sinkhorn 설정 (Actor1+용)
@@ -176,8 +199,9 @@ results/iql/halfcheetah_medium_v2/seed_0/
 
 ## 주요 파일
 
-- `algorithms/offline/pogo_multi_main.py`: 메인 학습 스크립트
-- `algorithms/offline/pogo_policies.py`: POGO policies (StochasticMLP, DeterministicMLP)
+- `algorithms/offline/pogo_multi_main.py`: PyTorch 메인 학습 스크립트
+- `algorithms/offline/pogo_multi_jax.py`: JAX 메인 학습 스크립트 (ReBRAC 기반)
+- `algorithms/offline/pogo_policies.py`: POGO policies (GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP)
 - `configs/offline/pogo_multi/`: 각 알고리즘별 config 파일
 - `run_iql_all_envs.sh`: 전체 환경 순차 학습 스크립트
 
@@ -185,13 +209,16 @@ results/iql/halfcheetah_medium_v2/seed_0/
 
 - `algorithms/offline/POGO_MULTI_README.md`: 상세 사용법 및 알고리즘별 설명
 - `algorithms/offline/POGO_MULTI_ARCHITECTURE.md`: 아키텍처 및 구현 세부사항
-- `algorithms/offline/POGO_MULTI_FLOW.md`: 실행 흐름 및 동작 원리
 
 ## 주의사항
 
 - **기존 알고리즘 파일은 수정하지 않음**: `iql.py`, `td3_bc.py`, `cql.py` 등은 그대로 유지
-- **Actor0의 w2_weight는 0**: 현재 설정에서 actor0는 W2/Sinkhorn penalty 없이 학습
-- **Expert 환경은 weights * 10**: `run_iql_all_envs.sh`에서 자동 적용
+- **Critic 업데이트는 원래 알고리즘의 actor만 사용**: 
+  - 모든 알고리즘에서 Critic/V/Q 업데이트는 기존 방식 그대로
+  - CQL의 경우 Q loss 계산에 원래 TanhGaussianPolicy 사용 (POGO multi-actors는 policy loss에만 사용)
+- **Actor0는 W2 penalty 없음**: Actor0는 각 알고리즘의 원래 actor loss만 사용 (w2_weights 리스트에 포함되지 않음)
+- **Multi-actor 학습은 Policy loss에서만**: Critic은 기존 방식 그대로, Actor만 multi-actor로 확장
+- **Expert 환경은 weights * 10**: `run_iql_all_envs.sh`에서 자동 적용 (`[100.0, 100.0]`)
 
 ## 참고
 

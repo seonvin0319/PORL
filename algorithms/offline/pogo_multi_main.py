@@ -4,12 +4,13 @@
 # Config에서 algorithm 선택 가능
 
 import copy
+import math
 import os
 import random
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import d4rl
 import gym
@@ -28,9 +29,108 @@ from .cql import ContinuousCQL, TanhGaussianPolicy, FullyConnectedQFunction, Sca
 from .awac import AdvantageWeightedActorCritic, soft_update
 from .sac_n import SACN, Actor as SACNActor, VectorizedCritic
 from .edac import EDAC
-from .pogo_policies import BaseActor, DeterministicMLP, StochasticMLP
+from .pogo_policies import BaseActor, DeterministicMLP, StochasticMLP, GaussianMLP, TanhGaussianMLP
 
 TensorBatch = List[torch.Tensor]
+
+
+@dataclass
+class ActorConfig:
+    """Actor 설정을 그룹화하는 dataclass (PyTorch 버전)
+    JAX 버전과 일관성을 유지하기 위해 동일한 구조 사용
+    """
+    actor: nn.Module
+    is_stochastic: bool
+    is_gaussian: bool
+    
+    @classmethod
+    def from_actor(cls, actor: nn.Module) -> 'ActorConfig':
+        """Actor 객체로부터 ActorConfig 생성"""
+        return cls(
+            actor=actor,
+            is_stochastic=getattr(actor, 'is_stochastic', False),
+            is_gaussian=getattr(actor, 'is_gaussian', False),
+        )
+
+
+class EnsembleCritic(nn.Module):
+    """Ensemble Critic for PyTorch (ReBRAC style)
+    Multiple independent critics, returns [num_critics, batch_size] Q values
+    """
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        num_critics: int = 2,
+        layernorm: bool = True,
+        n_hiddens: int = 3,
+    ):
+        super().__init__()
+        self.num_critics = num_critics
+        self.hidden_dim = hidden_dim
+        self.layernorm = layernorm
+        
+        # Create multiple independent critics
+        self.critics = nn.ModuleList([
+            self._make_critic(state_dim, action_dim, hidden_dim, layernorm, n_hiddens)
+            for _ in range(num_critics)
+        ])
+    
+    def _make_critic(self, state_dim, action_dim, hidden_dim, layernorm, n_hiddens):
+        """Create a single critic network"""
+        layers = []
+        # First layer
+        layers.append(nn.Linear(state_dim + action_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        if layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        
+        # Hidden layers
+        for _ in range(n_hiddens - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            if layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+        
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, 1))
+        
+        # Initialize as in ReBRAC (EDAC style)
+        net = nn.Sequential(*layers)
+        for i, layer in enumerate(net):
+            if isinstance(layer, nn.Linear):
+                if i == 0:
+                    # First layer: constant bias 0.1
+                    nn.init.constant_(layer.bias, 0.1)
+                    # Kaiming init for weight
+                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+                elif i == len([l for l in net if isinstance(l, nn.Linear)]) - 1:
+                    # Last layer: uniform init [-3e-3, 3e-3]
+                    nn.init.uniform_(layer.weight, -3e-3, 3e-3)
+                    nn.init.uniform_(layer.bias, -3e-3, 3e-3)
+                else:
+                    # Hidden layers: constant bias 0.1
+                    nn.init.constant_(layer.bias, 0.1)
+                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+        
+        return net
+    
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass
+        Args:
+            state: [batch_size, state_dim]
+            action: [batch_size, action_dim]
+        Returns:
+            q_values: [num_critics, batch_size]
+        """
+        state_action = torch.cat([state, action], dim=-1)  # [batch_size, state_dim + action_dim]
+        q_values = torch.stack([
+            critic(state_action).squeeze(-1)  # [batch_size]
+            for critic in self.critics
+        ], dim=0)  # [num_critics, batch_size]
+        return q_values
 
 
 @dataclass
@@ -49,7 +149,8 @@ class TrainConfig:
     algorithm: str = "iql"  # "iql", "cql", "td3_bc", "awac" 등
 
     # POGO Multi-Actor 설정
-    w2_weights: List[float] = field(default_factory=lambda: [10.0, 10.0, 10.0])
+    # w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+    w2_weights: List[float] = field(default_factory=lambda: [10.0, 10.0])
     num_actors: Optional[int] = None
     actor_configs: Optional[List[dict]] = None
 
@@ -105,11 +206,14 @@ class TrainConfig:
 
     def __post_init__(self):
         if self.num_actors is None:
-            self.num_actors = len(self.w2_weights)
-        if len(self.w2_weights) < self.num_actors:
-            w = self.w2_weights[0] if self.w2_weights else 1.0
-            self.w2_weights = self.w2_weights + [w] * (self.num_actors - len(self.w2_weights))
-        self.w2_weights = self.w2_weights[: self.num_actors]
+            # w2_weights는 Actor1부터이므로 num_actors = len(w2_weights) + 1
+            self.num_actors = len(self.w2_weights) + 1
+        # w2_weights는 Actor1부터이므로 num_actors - 1 길이여야 함
+        expected_len = self.num_actors - 1
+        if len(self.w2_weights) < expected_len:
+            w = self.w2_weights[-1] if self.w2_weights else 10.0
+            self.w2_weights = self.w2_weights + [w] * (expected_len - len(self.w2_weights))
+        self.w2_weights = self.w2_weights[:expected_len]
         self.name = f"{self.name}-{self.algorithm}-{self.env}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
@@ -143,37 +247,235 @@ def _create_multi_actors(
     device: str,
     lr: float,
 ):
-    """Multi-actor 생성: 모든 알고리즘에서 POGO policies 사용 (일관성)"""
+    """Multi-actor 생성: 모든 알고리즘에서 POGO policies 사용 (일관성)
+    Policy 클래스의 is_gaussian, is_stochastic 속성을 자동으로 사용
+    """
     actors = []
     actor_targets = []
     actor_optimizers = []
     actor_is_stochastic = []
+    actor_is_gaussian = []
 
     if actor_configs is None:
         actor_configs = [{} for _ in range(num_actors)]
 
     for i in range(num_actors):
         config = actor_configs[i]
-        deterministic = config.get("deterministic", False) if isinstance(config, dict) else getattr(config, "deterministic", False)
+        actor_type = config.get("type", "stochastic") if isinstance(config, dict) else getattr(config, "type", "stochastic")
 
         # 모든 알고리즘에서 POGO policies 사용 (sample_actions, deterministic_actions 지원)
-        if deterministic:
+        if actor_type == "gaussian":
+            # Gaussian: mean에 tanh 적용된 상태에서 샘플링
+            actor = GaussianMLP(state_dim, action_dim, max_action).to(device)
+        elif actor_type == "tanh_gaussian":
+            # TanhGaussian: unbounded Gaussian에서 샘플링 후 tanh 적용
+            actor = TanhGaussianMLP(state_dim, action_dim, max_action).to(device)
+        elif actor_type == "deterministic":
             actor = DeterministicMLP(state_dim, action_dim, max_action).to(device)
-            is_stochastic = False
-        else:
+        else:  # stochastic
             actor = StochasticMLP(state_dim, action_dim, max_action).to(device)
-            is_stochastic = True
+
+        # Policy 클래스의 속성에서 자동으로 가져옴
+        is_stochastic = getattr(actor, 'is_stochastic', False)
+        is_gaussian = getattr(actor, 'is_gaussian', False)
 
         actor_target = copy.deepcopy(actor)
         actors.append(actor)
         actor_targets.append(actor_target)
         actor_optimizers.append(torch.optim.Adam(actor.parameters(), lr=lr))
         actor_is_stochastic.append(is_stochastic)
+        actor_is_gaussian.append(is_gaussian)
 
-    return actors, actor_targets, actor_optimizers, actor_is_stochastic
+    return actors, actor_targets, actor_optimizers, actor_is_stochastic, actor_is_gaussian
 
 
-def _train_iql_multi_actor(
+def _closed_form_w2_gaussian(mean1, std1, mean2, std2):
+    """Closed form W2 distance for Gaussian distributions: ||μ1-μ2||² + ||σ1-σ2||²"""
+    mean_diff = mean1 - mean2
+    std_diff = std1 - std2
+    w2_squared = torch.sum(mean_diff ** 2, dim=-1) + torch.sum(std_diff ** 2, dim=-1)
+    return w2_squared.mean()
+
+
+def _compute_w2_distance(
+    actor_i_config: ActorConfig,
+    ref_actor_config: ActorConfig,
+    states: torch.Tensor,
+    sinkhorn_K: int = 4,
+    sinkhorn_blur: float = 0.05,
+    sinkhorn_loss=None,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    공통 W2 distance 계산 함수 (JAX 버전과 일관성 유지)
+    Policy 타입에 따라 자동으로 적절한 방법 선택:
+    - Both Gaussian → closed form W2
+    - Both Stochastic (not Gaussian) → Sinkhorn
+    - At least one Deterministic → L2
+    
+    Args:
+        actor_i_config: 현재 actor 설정
+        ref_actor_config: 참조 actor 설정
+        states: [B, state_dim]
+        sinkhorn_K: 샘플 수 (Gaussian이 아닌 경우에만 사용)
+        sinkhorn_blur: Sinkhorn regularization (Gaussian이 아닌 경우에만 사용)
+        sinkhorn_loss: Sinkhorn loss 객체 (None이면 자동 생성)
+        seed: 랜덤 시드
+    
+    Returns:
+        평균 distance (scalar)
+    """
+    # Both Gaussian: use closed form W2
+    if actor_i_config.is_gaussian and ref_actor_config.is_gaussian:
+        mean_i, std_i = actor_i_config.actor.get_mean_std(states)
+        with torch.no_grad():
+            mean_ref, std_ref = ref_actor_config.actor.get_mean_std(states)
+        return _closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref)
+    
+    # At least one is not Gaussian: use sampling-based methods
+    if actor_i_config.is_stochastic and ref_actor_config.is_stochastic:
+        # Both stochastic (but not Gaussian): use Sinkhorn
+        return _per_state_sinkhorn(
+            actor_i_config.actor, ref_actor_config.actor, states,
+            K=sinkhorn_K, blur=sinkhorn_blur,
+            sinkhorn_loss=sinkhorn_loss,
+            seed=seed,
+        )
+    else:
+        # At least one deterministic: use L2
+        pi_i = actor_i_config.actor.deterministic_actions(states)
+        with torch.no_grad():
+            ref_action = ref_actor_config.actor.deterministic_actions(states)
+        return torch.sum((pi_i - ref_action) ** 2, dim=-1).mean()
+
+
+def _compute_actor_loss_with_w2(
+    base_loss_fn: Callable[[nn.Module], torch.Tensor],
+    actor_i_config: ActorConfig,
+    ref_actor_config: Optional[ActorConfig],
+    states: torch.Tensor,
+    w2_weight: float,
+    sinkhorn_K: int = 4,
+    sinkhorn_blur: float = 0.05,
+    sinkhorn_loss=None,
+    seed: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    공통 multi-actor loss 계산 함수 (JAX 버전과 일관성 유지)
+    Actor0: base loss만 사용
+    Actor1+: base loss + w2_weight * w2_distance
+    
+    Args:
+        base_loss_fn: Base loss 계산 함수
+        actor_i_config: 현재 actor 설정
+        ref_actor_config: 참조 actor 설정 (Actor0인 경우 None)
+        states: [B, state_dim]
+        w2_weight: W2 distance 가중치
+        sinkhorn_K: 샘플 수
+        sinkhorn_blur: Sinkhorn regularization
+        sinkhorn_loss: Sinkhorn loss 객체
+        seed: 랜덤 시드
+    
+    Returns:
+        actor_loss: 계산된 loss
+        w2_distance: W2 distance (Actor0인 경우 None)
+    """
+    base_loss = base_loss_fn(actor_i_config.actor)
+    
+    if ref_actor_config is None:
+        # Actor0: W2 penalty 없음
+        return base_loss, None
+    
+    # Actor1+: W2 distance 계산
+    w2_distance = _compute_w2_distance(
+        actor_i_config=actor_i_config,
+        ref_actor_config=ref_actor_config,
+        states=states,
+        sinkhorn_K=sinkhorn_K,
+        sinkhorn_blur=sinkhorn_blur,
+        sinkhorn_loss=sinkhorn_loss,
+        seed=seed,
+    )
+    
+    return base_loss + w2_weight * w2_distance, w2_distance
+
+
+def _train_iql_multi_actor_gaussian(
+    trainer: ImplicitQLearning,
+    actors: List[nn.Module],
+    actor_targets: List[nn.Module],
+    actor_optimizers: List[torch.optim.Optimizer],
+    actor_is_gaussian: List[bool],
+    w2_weights: List[float],
+    batch: TensorBatch,
+    seed_base: int,
+) -> Dict[str, float]:
+    """IQL trainer에 multi-actor 적용 (Gaussian policy용 - closed form W2)"""
+    trainer.total_it += 1
+    observations, actions, rewards, next_observations, dones = batch
+    log_dict = {}
+
+    # Base IQL의 V, Q 업데이트
+    with torch.no_grad():
+        next_v = trainer.vf(next_observations)
+    adv = trainer._update_v(observations, actions, log_dict)
+    rewards = rewards.squeeze(dim=-1)
+    dones = dones.squeeze(dim=-1)
+    trainer._update_q(next_v, observations, actions, rewards, dones, log_dict)
+
+    # Multi-actor 업데이트
+    exp_adv = torch.exp(trainer.beta * adv.detach()).clamp(max=100.0)
+
+    for i in range(len(actors)):
+        actor_i = actors[i]
+
+        # Base loss 계산 함수 (클로저로 i와 exp_adv 캡처)
+        def base_loss_fn(actor):
+            mean_i, _ = actor.get_mean_std(observations)
+            if i == 0:
+                # Actor0: IQL BC loss
+                bc_losses = torch.sum((mean_i - actions) ** 2, dim=1)
+                return torch.mean(exp_adv * bc_losses)
+            else:
+                # Actor1+: Q 기반 loss
+                Q_i = trainer.qf(observations, mean_i)
+                return -Q_i.mean()
+
+        # W2 distance 계산 (ActorConfig 사용)
+        actor_i_config = ActorConfig.from_actor(actor_i)
+        ref_actor_config = ActorConfig.from_actor(actors[i - 1]) if i > 0 else None
+        w2_weight_i = w2_weights[i - 1] if i > 0 else 0.0
+        
+        actor_loss_i, w2_i = _compute_actor_loss_with_w2(
+            base_loss_fn=base_loss_fn,
+            actor_i_config=actor_i_config,
+            ref_actor_config=ref_actor_config,
+            states=observations,
+            w2_weight=w2_weight_i,
+            sinkhorn_K=4,  # Gaussian이므로 사용 안 됨
+            sinkhorn_blur=0.05,
+            sinkhorn_loss=None,
+            seed=seed_base + 100 + i,
+        )
+
+        opt = actor_optimizers[i]
+        opt.zero_grad()
+        actor_loss_i.backward()
+        opt.step()
+
+        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
+        if i > 0 and w2_i is not None:
+            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
+
+    # Target update
+    for actor, actor_target in zip(actors, actor_targets):
+        for p, tp in zip(actor.parameters(), actor_target.parameters()):
+            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
+
+    return log_dict
+
+
+def _train_iql_multi_actor_stochastic(
     trainer: ImplicitQLearning,
     actors: List[nn.Module],
     actor_targets: List[nn.Module],
@@ -187,12 +489,12 @@ def _train_iql_multi_actor(
     sinkhorn_loss,
     seed_base: int,
 ) -> Dict[str, float]:
-    """IQL trainer에 multi-actor 적용"""
-    trainer.total_it += 1  # Base trainer의 total_it 업데이트
+    """IQL trainer에 multi-actor 적용 (Stochastic policy용 - Sinkhorn)"""
+    trainer.total_it += 1
     observations, actions, rewards, next_observations, dones = batch
     log_dict = {}
 
-    # Base IQL의 V, Q 업데이트 (IQL 구조 그대로)
+    # Base IQL의 V, Q 업데이트
     with torch.no_grad():
         next_v = trainer.vf(next_observations)
     adv = trainer._update_v(observations, actions, log_dict)
@@ -205,54 +507,39 @@ def _train_iql_multi_actor(
 
     for i in range(len(actors)):
         actor_i = actors[i]
-        w2_weight_i = w2_weights[i]
 
-        if i == 0:
-            # Actor0: IQL loss + W2 to dataset
-            # Gradient가 필요하므로 forward() 직접 사용 (deterministic_actions는 @torch.no_grad())
-            if hasattr(actor_i, 'forward') and not actor_is_stochastic[i]:
-                # DeterministicMLP: forward() 직접 사용
-                pi_i = actor_i.forward(observations)
+        # Base loss 계산 함수
+        def base_loss_fn(actor):
+            if hasattr(actor, 'forward') and not actor_is_stochastic[i]:
+                pi_i = actor.forward(observations)
             else:
-                # StochasticMLP: sample_actions 사용 (gradient 있음)
-                pi_i = actor_i.sample_actions(observations, K=1, seed=seed_base + i)[:, 0, :]
-            bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
-            w2_i = bc_losses.mean()
-            # IQL style: exp_adv * bc_loss + w2 distance
-            actor_loss_i = torch.mean(exp_adv * bc_losses) + w2_weight_i * w2_i
-        else:
-            # Actor1+: Sinkhorn to previous actor
-            ref_actor = actors[i - 1]
+                pi_i = actor.sample_actions(observations, K=1, seed=seed_base + i)[:, 0, :]
             
-            # Gradient가 필요한 경우 forward() 직접 사용 (deterministic_actions는 @torch.no_grad())
-            if hasattr(actor_i, 'forward') and not actor_is_stochastic[i]:
-                # DeterministicMLP: forward() 직접 사용
-                pi_i = actor_i.forward(observations)
+            if i == 0:
+                # Actor0: IQL BC loss
+                bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
+                return torch.mean(exp_adv * bc_losses)
             else:
-                # StochasticMLP: sample_actions 사용
-                pi_i = actor_i.sample_actions(observations, K=1, seed=seed_base + i)[:, 0, :]
+                # Actor1+: Q 기반 loss
+                Q_i = trainer.qf(observations, pi_i)
+                return -Q_i.mean()
 
-            is_i_stoch = actor_is_stochastic[i]
-            is_ref_stoch = actor_is_stochastic[i - 1]
-
-            if is_i_stoch and is_ref_stoch:
-                w2_i = _per_state_sinkhorn(
-                    actor_i, ref_actor, observations,
-                    K=sinkhorn_K, blur=sinkhorn_blur,
-                    sinkhorn_loss=sinkhorn_loss,
-                    seed=seed_base + 100 + i,
-                )
-            else:
-                with torch.no_grad():
-                    if hasattr(ref_actor, 'forward') and not is_ref_stoch:
-                        ref_action = ref_actor.forward(observations)
-                    else:
-                        ref_action = ref_actor.deterministic_actions(observations)
-                w2_i = ((pi_i - ref_action) ** 2).mean()
-
-            # Q 기반 loss
-            Q_i = trainer.qf(observations, pi_i)
-            actor_loss_i = -Q_i.mean() + w2_weight_i * w2_i
+        # W2 distance 계산 (ActorConfig 사용)
+        actor_i_config = ActorConfig.from_actor(actor_i)
+        ref_actor_config = ActorConfig.from_actor(actors[i - 1]) if i > 0 else None
+        w2_weight_i = w2_weights[i - 1] if i > 0 else 0.0
+        
+        actor_loss_i, w2_i = _compute_actor_loss_with_w2(
+            base_loss_fn=base_loss_fn,
+            actor_i_config=actor_i_config,
+            ref_actor_config=ref_actor_config,
+            states=observations,
+            w2_weight=w2_weight_i,
+            sinkhorn_K=sinkhorn_K,
+            sinkhorn_blur=sinkhorn_blur,
+            sinkhorn_loss=sinkhorn_loss,
+            seed=seed_base + 100 + i,
+        )
 
         opt = actor_optimizers[i]
         opt.zero_grad()
@@ -260,7 +547,7 @@ def _train_iql_multi_actor(
         opt.step()
 
         log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0:
+        if i > 0 and w2_i is not None:
             log_dict[f"w2_{i}_distance"] = float(w2_i.item())
 
     # Target update
@@ -318,7 +605,6 @@ def _train_cql_multi_actor(
     # Multi-actor 업데이트 (POGO policies 사용)
     for i in range(len(actors)):
         actor_i = actors[i]
-        w2_weight_i = w2_weights[i]
         
         # POGO policies 사용
         new_actions_i = actor_i.deterministic_actions(observations)
@@ -326,23 +612,22 @@ def _train_cql_multi_actor(
         alpha_i, _ = trainer._alpha_and_alpha_loss(observations, log_pi_i)
         
         if i == 0:
-            # Actor0: CQL policy loss + W2 to dataset
+            # Actor0: CQL policy loss만 사용 (W2 penalty 없음)
             # CQL policy loss: alpha * log_pi - Q (BC steps 후)
             if trainer.total_it <= trainer.bc_steps:
                 # BC 단계: log_prob 대신 L2 사용
                 bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
-                policy_loss_base = (alpha_i * log_pi_i.mean() - bc_loss).mean()
+                actor_loss_i = (alpha_i * log_pi_i.mean() - bc_loss).mean()
             else:
                 q_new = torch.min(
                     trainer.critic_1(observations, new_actions_i),
                     trainer.critic_2(observations, new_actions_i)
                 )
-                policy_loss_base = (alpha_i * log_pi_i.mean() - q_new).mean()
-            w2_i = ((new_actions_i - actions) ** 2).mean()
-            actor_loss_i = policy_loss_base + w2_weight_i * w2_i
+                actor_loss_i = (alpha_i * log_pi_i.mean() - q_new).mean()
         else:
             # Actor1+: Sinkhorn to previous actor
             ref_actor = actors[i - 1]
+            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
             is_i_stoch = actor_is_stochastic[i]
             is_ref_stoch = actor_is_stochastic[i - 1]
             
@@ -418,12 +703,11 @@ def _train_awac_multi_actor(
     # Multi-actor 업데이트
     for i in range(len(actors)):
         actor_i = actors[i]
-        w2_weight_i = w2_weights[i]
         
         trainer._actor = actor_i  # 현재 actor로 교체
         
         if i == 0:
-            # Actor0: AWAC loss + W2 to dataset
+            # Actor0: AWAC loss만 사용 (W2 penalty 없음)
             # AWAC의 actor loss 계산
             with torch.no_grad():
                 pi_action = actor_i.deterministic_actions(states)
@@ -448,11 +732,11 @@ def _train_awac_multi_actor(
                 # StochasticMLP: sample_actions 사용
                 pi_i = actor_i.sample_actions(states, K=1, seed=seed_base + i)[:, 0, :]
             bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
-            w2_i = bc_losses.mean()
-            actor_loss_i = torch.mean(weights * bc_losses) + w2_weight_i * w2_i
+            actor_loss_i = torch.mean(weights * bc_losses)
         else:
             # Actor1+: Sinkhorn to previous actor
             ref_actor = actors[i - 1]
+            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
             is_i_stoch = actor_is_stochastic[i]
             is_ref_stoch = actor_is_stochastic[i - 1]
             
@@ -554,12 +838,11 @@ def _train_sac_n_multi_actor(
     # Multi-actor 업데이트 (POGO policies 사용)
     for i in range(len(actors)):
         actor_i = actors[i]
-        w2_weight_i = w2_weights[i]
         
         trainer.actor = actor_i  # 현재 actor로 교체
         
         if i == 0:
-            # Actor0: SAC-N loss + W2 to dataset
+            # Actor0: SAC-N loss만 사용 (W2 penalty 없음)
             # SAC-N의 actor loss: alpha * log_pi - Q_min
             # POGO policies는 log_prob를 직접 제공하지 않으므로 근사
             pi_i = actor_i.deterministic_actions(state)
@@ -567,12 +850,11 @@ def _train_sac_n_multi_actor(
             q_value_min = q_value_dist.min(0).values
             # log_prob 근사 (작은 값 사용)
             log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_base = (trainer.alpha * log_pi_i - q_value_min).mean()
-            w2_i = ((pi_i - action) ** 2).mean()
-            actor_loss_i = actor_loss_base + w2_weight_i * w2_i
+            actor_loss_i = (trainer.alpha * log_pi_i - q_value_min).mean()
         else:
             # Actor1+: Sinkhorn to previous actor
             ref_actor = actors[i - 1]
+            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
             is_i_stoch = actor_is_stochastic[i]
             is_ref_stoch = actor_is_stochastic[i - 1]
             
@@ -662,23 +944,21 @@ def _train_edac_multi_actor(
     # Multi-actor 업데이트 (POGO policies 사용)
     for i in range(len(actors)):
         actor_i = actors[i]
-        w2_weight_i = w2_weights[i]
         
         trainer.actor = actor_i  # 현재 actor로 교체
         
         if i == 0:
-            # Actor0: EDAC loss + W2 to dataset
+            # Actor0: EDAC loss만 사용 (W2 penalty 없음)
             # EDAC의 actor loss: alpha * log_pi - Q_min
             pi_i = actor_i.deterministic_actions(state)
             q_value_dist = trainer.critic(state, pi_i)
             q_value_min = q_value_dist.min(0).values
             log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_base = (trainer.alpha * log_pi_i - q_value_min).mean()
-            w2_i = ((pi_i - action) ** 2).mean()
-            actor_loss_i = actor_loss_base + w2_weight_i * w2_i
+            actor_loss_i = (trainer.alpha * log_pi_i - q_value_min).mean()
         else:
             # Actor1+: Sinkhorn to previous actor
             ref_actor = actors[i - 1]
+            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
             is_i_stoch = actor_is_stochastic[i]
             is_ref_stoch = actor_is_stochastic[i - 1]
             
@@ -770,7 +1050,6 @@ def _train_td3_bc_multi_actor(
     if trainer.total_it % trainer.policy_freq == 0:
         for i in range(len(actors)):
             actor_i = actors[i]
-            w2_weight_i = w2_weights[i]
 
             # POGO policies 사용
             pi_i = actor_i.deterministic_actions(state)
@@ -778,12 +1057,12 @@ def _train_td3_bc_multi_actor(
             lmbda = trainer.alpha / q.abs().mean().detach()
 
             if i == 0:
-                # Actor0: TD3_BC loss + W2
-                w2_i = ((pi_i - action) ** 2).mean()
-                actor_loss_i = -lmbda * q.mean() + w2_weight_i * w2_i
+                # Actor0: TD3_BC loss만 사용 (W2 penalty 없음)
+                actor_loss_i = -lmbda * q.mean() + trainer.alpha * ((pi_i - action) ** 2).mean()
             else:
                 # Actor1+: Sinkhorn to previous actor
                 ref_actor = actors[i - 1]
+                w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
                 is_i_stoch = actor_is_stochastic[i]
                 is_ref_stoch = actor_is_stochastic[i - 1]
 
@@ -879,7 +1158,7 @@ def train(config: TrainConfig):
     set_seed(config.seed, env)
 
     # Multi-actor 생성
-    actors, actor_targets, actor_optimizers, actor_is_stochastic = _create_multi_actors(
+    actors, actor_targets, actor_optimizers, actor_is_stochastic, actor_is_gaussian = _create_multi_actors(
         state_dim, action_dim, max_action, config.num_actors,
         config.actor_configs, config.algorithm, config.device, config.actor_lr
     )
@@ -909,13 +1188,22 @@ def train(config: TrainConfig):
             device=config.device,
         )
 
+        # Gaussian과 Stochastic 구분
+        use_gaussian = any(actor_is_gaussian)
+        
         def train_fn(batch):
             seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
-            return _train_iql_multi_actor(
-                trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
-            )
+            if use_gaussian:
+                return _train_iql_multi_actor_gaussian(
+                    trainer, actors, actor_targets, actor_optimizers, actor_is_gaussian,
+                    config.w2_weights, batch, seed_base
+                )
+            else:
+                return _train_iql_multi_actor_stochastic(
+                    trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
+                    config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
+                    config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+                )
 
     elif config.algorithm == "td3_bc":
         critic_1 = Critic(state_dim, action_dim).to(config.device)
@@ -1094,8 +1382,8 @@ def train(config: TrainConfig):
 
     print("---------------------------------------", flush=True)
     print(f"Training POGO Multi-Actor ({config.algorithm.upper()}), Env: {config.env}, Seed: {config.seed}", flush=True)
-    print(f"  Actors: {config.num_actors}, W2 weights: {config.w2_weights}", flush=True)
-    print("  Actor0: W2 to dataset, Actor1+: Sinkhorn", flush=True)
+    print(f"  Actors: {config.num_actors}, W2 weights (Actor1+): {config.w2_weights}", flush=True)
+    print("  Actor0: 원래 알고리즘 loss만 사용, Actor1+: Sinkhorn", flush=True)
     print("---------------------------------------", flush=True)
 
     evaluations = {i: [] for i in range(config.num_actors)}

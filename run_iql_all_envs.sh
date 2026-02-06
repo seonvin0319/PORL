@@ -1,6 +1,7 @@
 #!/bin/bash
 # IQL 전체 환경 순차 실행 (seed 0)
-# w2_weights: actor0=0, actor1/2만 적용 (일반 [0,10,10], expert [0,100,100])
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+# 일반: [10.0, 10.0], expert: [100.0, 100.0]
 
 set -e
 
@@ -32,9 +33,9 @@ EVAL_FREQ=5000
 N_EPISODES=10
 DEVICE="cuda"
 
-# actor0=0, actor1/2만 w2/sinkhorn 적용
-W2_WEIGHTS_BASE="[0.0, 10.0, 10.0]"
-W2_WEIGHTS_EXPERT="[0.0, 100.0, 100.0]"
+# Actor1부터의 가중치 (Actor0는 W2 penalty 없음)
+W2_WEIGHTS_BASE="[10.0, 10.0]"
+W2_WEIGHTS_EXPERT="[100.0, 100.0]"
 
 echo "=========================================="
 echo "IQL 전체 환경 순차 학습"

@@ -156,8 +156,10 @@ for batch in replay_buffer:
 
 ### POGO Multi-Actor 적용 후
 
-- **Actor0**: `L₀ = [기존 알고리즘 loss] + w₂₀ · ||π₀ - a_dataset||²`
+- **Actor0**: `L₀ = [기존 알고리즘 loss]` (W2 penalty 없음, w2_weights 리스트에 포함되지 않음)
 - **Actor1+**: `Lᵢ = [기존 알고리즘 loss] + w₂ᵢ · Sinkhorn(πᵢ, πᵢ₋₁)`
+
+**참고**: Critic 업데이트는 모든 알고리즘에서 원래 알고리즘의 actor만 사용 (CQL의 경우 TanhGaussianPolicy 사용)
 
 ## 파일 구조
 
@@ -168,7 +170,12 @@ algorithms/offline/
 ├── iql.py                   # IQL (그대로 사용)
 ├── td3_bc.py                # TD3_BC (그대로 사용)
 ├── cql.py                   # CQL (그대로 사용)
-└── ...
+├── awac.py                  # AWAC (그대로 사용)
+├── sac_n.py                 # SAC-N (그대로 사용)
+├── edac.py                  # EDAC (그대로 사용)
+├── POGO_MULTI_README.md     # 상세 사용법
+├── POGO_MULTI_ARCHITECTURE.md  # 아키텍처 설명 (이 파일)
+└── POGO_MULTI_FLOW.md      # 실행 흐름 설명
 
 configs/offline/pogo_multi/
 ├── halfcheetah/
