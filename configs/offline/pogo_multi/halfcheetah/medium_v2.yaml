@@ -1,0 +1,38 @@
+# POGO Multi-Actor: Actor0=W2, Actor1+=Sinkhorn
+# base_algorithm으로 다른 알고리즘 config 참조 가능 (iql, cql, td3_bc 등)
+
+env: halfcheetah-medium-v2
+seed: 0
+eval_freq: 5000
+n_episodes: 10
+max_timesteps: 1000000
+
+# Algorithm config 참조 (선택사항)
+# base_algorithm: iql   # IQL config의 hyperparameter 사용
+# base_config_path: configs/offline/iql/halfcheetah/medium_v2.yaml
+
+# POGO Multi-Actor
+w2_weights: [10.0, 10.0, 10.0]  # actor0, actor1, actor2
+num_actors: 3
+# actor_configs: [{"deterministic": false}, {"deterministic": false}, {"deterministic": false}]
+
+# Sinkhorn (actor1+용)
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+sinkhorn_backend: "tensorized"
+
+# TD3/Critic
+batch_size: 256
+discount: 0.99
+tau: 0.005
+policy_noise: 0.2
+noise_clip: 0.5
+policy_freq: 2
+lr: 3e-4
+
+normalize: true
+normalize_reward: false
+
+project: CORL
+group: pogo-multi-halfcheetah
+name: pogo-multi

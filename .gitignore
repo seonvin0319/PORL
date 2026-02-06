@@ -4,7 +4,7 @@ mlc_run.sh
 wandb_run.sh
 sweep_config.yaml
 .ml-job-preset.yml
-wandb
+wandb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -13,7 +13,7 @@ __pycache__/
 
 # C extensions
 *.so
-.idea
+.idea/
 
 # Distribution / packaging
 .Python
@@ -37,8 +37,6 @@ share/python-wheels/
 MANIFEST
 
 # PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
 
@@ -65,7 +63,6 @@ coverage.xml
 *.pot
 
 # Django stuff:
-*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -94,13 +91,9 @@ ipython_config.py
 .python-version
 
 # pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
 #Pipfile.lock
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+# PEP 582
 __pypackages__/
 
 # Celery stuff
@@ -137,12 +130,66 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# custom
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-.csv
-.tsv
-.pth
-.json
-.yaml
-wandb
+Thumbs.db
+
+# ============================================
+# ML/RL Project Specific
+# ============================================
+
+# Results and checkpoints (전체 폴더 무시)
+results/
+*.pt
+*.pth
+*.pkl
+*.ckpt
+*.h5
+*.hdf5
+
+# Logs (results 폴더 내의 로그만 무시, 루트의 로그는 유지 가능)
+results/**/*.log
+results/**/*.json
+results/**/*.csv
+results/**/*.npy
+results/**/*.npz
+
+# Training scripts output logs
+*_all_envs_*.log
+*_training_*.log
+
+# Data files (일반적으로 무시, 필요시 예외 처리)
+*.csv
+*.tsv
+*.parquet
+
+# Temporary files
+*.tmp
+*.temp
+*.pid
+
+# Model checkpoints and weights (명시적으로)
+checkpoints/
+models/
+weights/
+saved_models/
+
+# Dataset cache
+*.cache
+.cache/
+data/cache/
+
+# Experiment tracking (wandb는 이미 위에 있음)
+mlruns/
+tensorboard_logs/
+tb_logs/
+
+# Assets (이미 위에 있지만 명시)
 assets/

@@ -1,0 +1,23 @@
+# POGO Multi-Actor + IQL config 참조
+# base_algorithm으로 IQL의 hyperparameter 사용
+
+env: halfcheetah-medium-v2
+base_algorithm: iql
+
+w2_weights: [10.0, 10.0, 10.0]
+num_actors: 3
+
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+
+batch_size: 256
+discount: 0.99
+tau: 0.005
+lr: 3e-4
+
+normalize: true
+normalize_reward: false
+
+project: CORL
+group: pogo-multi-iql-base
+name: pogo-multi-iql
