@@ -10,11 +10,11 @@ POGO Multi-Actor는 **JKO (Jordan-Kinderlehrer-Otto) Chain**을 사용하여 여
 
 ### Multi-Actor 구조
 
-- **Actor 0 (π₀)**: 각 알고리즘의 원래 actor loss만 사용 (W2 regularization 없음)
+- **Actor0 (π₀)**: 각 알고리즘의 원래 actor loss만 사용 (W2 regularization 없음)
   - Offline RL에서는 데이터셋의 action과의 L2 distance 또는 BC loss 사용
   - 이전 정책에 대한 제약 없이 자유롭게 학습
   
-- **Actor i (π_i, i ≥ 1)**: 이전 actor (π_{i-1})에 대한 W2 거리로 학습
+- **Actor1+ (π_i, i ≥ 1)**: 이전 actor (π_{i-1})에 대한 W2 거리로 학습
   - Loss: `base_loss + w_i · W₂(π_i, π_{i-1})`
   - 이전 actor라는 연속적인 분포를 reference로 하여 분포 간 거리를 측정하는 W2 거리 사용
 
@@ -309,6 +309,25 @@ sinkhorn_blur: 0.05
    - 모든 알고리즘에서 POGO policies 사용
    - Actor 개수: config에서 지정 (예: 3개)
    - Actor loss만 변경: Multi-actor 학습은 Policy loss에서만 수행
+
+### 알고리즘별 비교표
+
+| 알고리즘 | 프레임워크 | Critic 구조 | Actor0 Loss | Actor1+ Loss | Critic 업데이트 |
+|---------|-----------|------------|-------------|-------------|----------------|
+| **IQL** | PyTorch | V + Q (expectile) | `exp(β·adv) · BC_loss` | `exp(β·adv) · BC_loss + w2·W2` | V, Q 업데이트 (Actor0 사용) |
+| **TD3_BC** | PyTorch | Twin Critic | `-λ·Q + BC_loss` | `-λ·Q + BC_loss + w2·W2` | Twin Critic 업데이트 (Actor0 사용) |
+| **CQL** | PyTorch | Twin Critic | `CQL_policy_loss` | `CQL_policy_loss + w2·W2` | Q loss (원래 TanhGaussianPolicy 사용) |
+| **AWAC** | PyTorch | Twin Critic | `weights · BC_loss` | `weights · BC_loss + w2·W2` | Twin Critic 업데이트 (Actor0 사용) |
+| **SAC-N** | PyTorch | Vectorized Critic | `α·log_π - Q_min` | `α·log_π - Q_min + w2·W2` | Ensemble Critic 업데이트 (Actor0 사용) |
+| **EDAC** | PyTorch | Vectorized Critic | `α·log_π - Q_min` | `α·log_π - Q_min + w2·W2` | Ensemble Critic + diversity (Actor0 사용) |
+| **ReBRAC** | JAX | Ensemble Critic | `β·BC_penalty - λ·Q` | `β·BC_penalty - λ·Q + w2·W2` | Ensemble Critic 업데이트 (Actor0 사용) |
+| **FQL** | JAX | Q function | `BC_flow_loss` | `-Q + w2·W2` | Q 업데이트 (Actor0 사용) |
+
+**주요 차이점**:
+- **Critic 업데이트**: 모든 알고리즘에서 Actor0만 사용 (원래 알고리즘과 동일)
+- **Actor0**: 각 알고리즘의 원래 actor loss만 사용 (W2 penalty 없음)
+- **Actor1+**: 각 알고리즘의 actor loss + W2 distance to previous actor
+- **FQL 특수**: Actor0는 BC flow loss, Actor1+는 Q loss만 사용
 
 ### Actor 학습 방식
 

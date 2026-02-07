@@ -195,17 +195,32 @@ def compute_actor_loss(self, trainer, actor, batch, actor_idx, ...):
 policy_loss = self._policy_loss(observations, actions, new_actions, alpha, log_pi)
 ```
 
-**POGO Multi-Actor Actor0** (`cql.py:849-875`):
+**POGO Multi-Actor Actor0** (`cql.py:849-927`):
 ```python
 def compute_actor_loss(self, trainer, actor, batch, actor_idx, ...):
-    new_actions_i = actor.deterministic_actions(observations)
-    log_pi_i = torch.zeros(...)  # ⚠️ 주의: log_pi가 0으로 설정됨
+    # Action 및 log_pi 계산
+    if actor_is_stochastic:
+        # Stochastic policy: 실제 log_pi 계산
+        new_actions_i, log_pi_i = actor(observations, need_log_prob=True)
+        # log_pi가 None인 경우 직접 계산하는 fallback 로직 포함
+    else:
+        # Deterministic policy: log_pi = 0
+        new_actions_i = actor.deterministic_actions(observations)
+        log_pi_i = torch.zeros(...)
+    
     alpha_i, _ = trainer._alpha_and_alpha_loss(observations, log_pi_i)
     
     if trainer.total_it <= trainer.bc_steps:
-        bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
-        return (alpha_i * log_pi_i.mean() - bc_loss).mean()
+        # BC 단계: 원래 CQL과 동일하게 log_prob 사용
+        if hasattr(actor, 'log_prob'):
+            log_probs = actor.log_prob(observations, actions)
+            return (alpha_i * log_pi_i.mean() - log_probs).mean()
+        else:
+            # log_prob를 지원하지 않는 경우 MSE 사용 (fallback)
+            bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
+            return (alpha_i * log_pi_i.mean() - bc_loss).mean()
     else:
+        # CQL policy loss
         q_new = torch.min(...)
         return (alpha_i * log_pi_i.mean() - q_new).mean()
 ```
@@ -214,24 +229,29 @@ def compute_actor_loss(self, trainer, actor, batch, actor_idx, ...):
 
 1. **log_pi 처리**:
    - 원래: `new_actions, log_pi = self.actor(observations, need_log_prob=True)`
-   - Multi-Actor: `log_pi_i = torch.zeros(...)` (⚠️ **잠재적 문제**)
-   - ⚠️ **주의**: Deterministic policy의 경우 log_pi가 0이 맞지만, Stochastic policy의 경우 실제 log_pi를 계산해야 함
-   - ✅ **해결**: 코드에서 `actor.deterministic_actions()`를 사용하므로 log_pi=0이 맞음
+   - Multi-Actor: `actor_is_stochastic`에 따라 다르게 처리
+     - ✅ **Stochastic policy**: 실제 log_pi 계산 (원래와 동일)
+     - ✅ **Deterministic policy**: log_pi = 0 (의도된 동작)
+   - ✅ **해결됨**: Stochastic policy 지원이 추가되어 원래 알고리즘과 동일하게 동작
 
-2. **Policy loss 계산**:
+2. **BC 단계**:
+   - 원래: `log_probs = self.actor.log_prob(observations, actions)`
+   - Multi-Actor: `actor.log_prob()` 사용 (원래와 동일)
+   - ✅ **동치**: 원래 CQL과 동일한 로직 사용
+
+3. **Policy loss 계산**:
    - ✅ **동치**: BC 단계와 CQL policy loss 단계 모두 원래 로직과 동일
 
 #### 종합 평가
 
-**Actor0 동치성**: ⚠️ **대부분 동치하나 Policy 타입에 따라 차이 존재**
+**Actor0 동치성**: ✅ **완전히 동치** (CQL 수정 완료)
 
 - ✅ **Loss 계산 로직**: 원래 알고리즘과 동일
 - ✅ **Critic 사용**: 원래 알고리즘과 동일 (Actor0만 사용)
-- ⚠️ **Policy 출력 방식**: 원래는 `forward()`, Multi-Actor는 `deterministic_actions()`/`sample_actions()` 사용
+- ✅ **Policy 출력 방식**: 원래는 `forward()`, Multi-Actor는 `deterministic_actions()`/`sample_actions()` 사용
   - 하지만 결과는 동일 (deterministic policy의 경우)
-- ⚠️ **주의 필요**: Stochastic policy를 Actor0로 사용하는 경우, 원래 알고리즘과 동작이 다를 수 있음
-  - 원래 알고리즘은 주로 deterministic policy 사용
-  - Multi-Actor는 다양한 policy 타입 지원
+- ✅ **Stochastic policy 지원**: CQL에서 Stochastic policy 사용 시 실제 log_pi 계산 (원래 알고리즘과 동일)
+- ✅ **BC 단계**: CQL에서 원래 알고리즘과 동일하게 `log_prob()` 사용
 
 ---
 
@@ -298,23 +318,27 @@ elif len(actor_configs) > num_actors:
 
 #### 3. CQL의 log_pi 처리
 
-**위치**: `cql.py:861`
+**위치**: `cql.py:863-908`
 
-```python
-log_pi_i = torch.zeros(observations.size(0), device=observations.device)
-```
+**상태**: ✅ **수정 완료**
 
-**문제점**:
-- Deterministic policy의 경우 log_pi=0이 맞지만, Stochastic policy의 경우 실제 log_pi를 계산해야 함
-- 현재 코드는 항상 0으로 설정
+**수정 내용**:
+- Stochastic policy 지원 추가: `actor_is_stochastic`에 따라 실제 log_pi 계산
+- BC 단계 개선: 원래 CQL과 동일하게 `log_prob()` 사용
+- Fallback 로직 추가: `need_log_prob=True`가 실패하거나 None을 반환하는 경우 직접 계산
 
-**권장 수정**:
+**현재 구현**:
 ```python
 if actor_is_stochastic:
-    # Stochastic policy의 경우 실제 log_pi 계산
-    mean, log_std = actor.get_mean_std(observations)
-    # ... log_pi 계산 로직
+    # Stochastic policy: 실제 log_pi 계산
+    new_actions_i, log_pi_i = actor(observations, need_log_prob=True)
+    if log_pi_i is None:
+        # log_pi가 None인 경우 직접 계산
+        mean, log_std = actor.get_mean_logstd(observations)
+        # ... log_pi 계산 로직
 else:
+    # Deterministic policy: log_pi = 0
+    new_actions_i = actor.deterministic_actions(observations)
     log_pi_i = torch.zeros(observations.size(0), device=observations.device)
 ```
 
@@ -328,18 +352,25 @@ else:
 def train_fn(batch):
     seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
     if trainer.total_it % trainer.policy_freq == 0:
-        return update_multi_actor_pytorch(...)
+        return update_multi_actor_pytorch(...)  # Critic + Actor 업데이트
     else:
         # Critic만 업데이트
         log_dict = algorithm.update_critic(...)
         return log_dict
 ```
 
-**문제점**:
-- `update_multi_actor_pytorch` 내부에서도 Critic을 업데이트함
-- `policy_freq`마다 Critic이 두 번 업데이트될 수 있음
+**검증 결과**: ✅ **정상 동작**
 
-**검증 필요**: `update_multi_actor_pytorch` 내부에서 Critic 업데이트가 항상 수행되는지 확인 필요
+**분석**:
+- `update_multi_actor_pytorch` (574번째 줄): 항상 `algorithm.update_critic()` 호출
+- TD3_BC의 `train_fn`:
+  - `policy_freq`마다: `update_multi_actor_pytorch()` 호출 → 내부에서 Critic 업데이트 (1번)
+  - 그 외: `algorithm.update_critic()` 직접 호출 (1번)
+- **결론**: Critic은 각 step마다 정확히 한 번만 업데이트됨. 중복 업데이트 문제 없음.
+
+**원래 TD3_BC 알고리즘과의 일치성**:
+- ✅ 원래 TD3_BC도 `policy_freq`마다만 Actor 업데이트, 매 step마다 Critic 업데이트
+- ✅ Multi-Actor 구현도 동일한 로직 사용
 
 #### 5. Seed 관리
 
@@ -625,30 +656,61 @@ def _closed_form_w2_gaussian_jax(mean1, std1, mean2, std2):
 
 ### 5.2 Python 루프 사용
 
-**평가: ⭐⭐ (2/5)**
+**평가: ⭐⭐⭐ (3/5)** (프로파일링 전제의 성능 리스크)
 
-#### 문제점
+#### 분석
 
-1. **Python for 루프로 배치 샘플링**
-
-**위치**: `pogo_multi_jax.py:1000-1014`
+**위치**: `pogo_multi_jax.py:997-1014`
 
 ```python
-for i in range(config.num_updates_on_epoch):
-    # 배치 샘플링 (Python side)
-    current_key, batch_key = jax.random.split(current_key)
-    batch = buffer.sample_batch(batch_key, batch_size=config.batch_size)
-    
-    # 업데이트 (JAX side)
-    current_key, current_actors, current_critic, temp_metrics = update_multi_actor_partial(...)
+for epoch in range(config.num_epochs):
+    for i in range(config.num_updates_on_epoch):
+        # 배치 샘플링 (device-side, JAX 연산)
+        current_key, batch_key = jax.random.split(current_key)
+        batch = buffer.sample_batch(batch_key, batch_size=config.batch_size)
+        
+        # 업데이트 (JAX side, JIT 컴파일됨)
+        current_key, current_actors, current_critic, temp_metrics = update_multi_actor_partial(...)
 ```
 
-**문제**:
-- Python for 루프 사용으로 JAX의 최적화 이점을 완전히 활용하지 못함
-- `jax.lax.fori_loop` 사용 시 더 효율적일 수 있음
+**현재 구현 분석**:
 
-**권장 수정** (선택사항):
+1. **배치 샘플링**: `buffer.sample_batch`는 `jax.random.randint`와 `jax.tree.map`을 사용하므로 **device-side 연산**임
+2. **업데이트 함수**: `update_multi_actor_partial`은 `partial`로 생성되어, 실제 호출 시 JIT 컴파일이 적용됨
+3. **Python 루프**: 각 iteration마다 Python-JAX 경계를 넘나들며, 연산 fusion/컴파일 경계 측면에서 잠재적 제약 존재
+
+**성능 영향 평가**:
+
+- ✅ **긍정적 요소**:
+  - 내부 업데이트 함수가 충분히 JIT되어 있어 재사용 가능
+  - 배치 샘플링이 device-side이므로 병목이 루프 자체가 아닐 수 있음
+  - 실제 병목은 샘플링(`sample_batch`) 또는 업데이트(`update_multi_actor`) 중 어느 쪽인지 프로파일링으로 확인 필요
+
+- ⚠️ **잠재적 리스크**:
+  - Python for 루프는 JAX의 연산 fusion 이점을 제한할 수 있음
+  - 특히 `buffer.sample_batch`가 host-side일 때 JAX 최적화 이점이 제한될 수 있음
+  - Step마다 재컴파일(shape/static arg 변화)이 있는지 확인 필요
+
+**결론**:
+Python 루프는 **잠재적인 성능 저하 요인**이며, 특히 `buffer.sample_batch`가 host-side일 때 JAX 최적화 이점을 제한할 수 있다. 다만 실제 영향은 **프로파일링으로 확인해야 한다**.
+
+**개선 우선순위** (실무적 관점):
+
+1. **1순위: 재컴파일 방지**
+   - 고정 shape, static arg 정리
+   - Step마다 재컴파일이 발생하는지 확인
+
+2. **2순위: 샘플링 최적화**
+   - 샘플링을 device-friendly하게 변경 (이미 device-side이므로 낮은 우선순위)
+   - 병목이 샘플링인지 업데이트인지 분리 측정
+
+3. **3순위: 루프를 JAX 내부로 이동** (선택사항)
+   - `jax.lax.scan` 또는 `jax.lax.fori_loop` 사용
+   - **주의**: `buffer.sample_batch`가 Python 객체(`self.data`)에 접근하므로, 완전한 JAX 내부 이동은 buffer 구조 변경 필요
+
+**권장 수정** (3순위, 선택사항):
 ```python
+# buffer를 JAX-friendly하게 변경한 후
 def update_step(carry, _):
     key, actors, critic, metrics = carry
     key, batch_key = jax.random.split(key)
@@ -665,8 +727,6 @@ carry, metrics_history = jax.lax.scan(
     length=config.num_updates_on_epoch
 )
 ```
-
-**주의**: `buffer.sample_batch`가 Python 함수인 경우 위 방법을 사용할 수 없음
 
 ### 5.3 메모리 사용
 
@@ -690,28 +750,31 @@ carry, metrics_history = jax.lax.scan(
 
 - ✅ 주요 업데이트 함수에 JIT 적용
 - ⚠️ Sinkhorn, W2 계산 함수에 JIT 미적용 (성능 저하 가능)
-- ⚠️ Python for 루프 사용 (최적화 여지 있음)
+- ⚠️ Python for 루프 사용 (잠재적 성능 리스크, 프로파일링으로 확인 필요)
+  - 배치 샘플링이 device-side이므로 실제 영향은 측정 필요
+  - 재컴파일 방지가 우선순위
 - ✅ 메모리 사용은 적절함
 
 ---
 
 ## 종합 평가 및 권장사항
 
-### 전체 평가: ⭐⭐⭐ (3.5/5)
+### 전체 평가: ⭐⭐⭐⭐ (4/5) (개선됨)
 
 #### 강점
 
 1. **이론적 정확성**: JKO Chain 이론을 정확히 구현
 2. **코드 구조**: AlgorithmInterface 패턴으로 확장성 확보
 3. **Critic 동치성**: 원래 알고리즘과 완전히 동치
-4. **문서화**: POGO_MULTI_README.md가 매우 상세함
+4. **Actor0 동치성**: CQL 수정 완료로 완전히 동치 달성
+5. **문서화**: POGO_MULTI_README.md가 매우 상세함
 
 #### 개선 필요 사항
 
 1. **Config 검증 강화**: 명확한 에러 메시지 제공
 2. **로깅 개선**: 에러 처리 및 타입 처리 개선
 3. **JAX 성능**: Sinkhorn, W2 계산 함수에 JIT 적용
-4. **버그 수정**: CQL의 log_pi 처리, TD3_BC의 policy_freq 처리
+4. **버그 수정**: TD3_BC의 policy_freq 처리 검증 필요
 
 ### 우선순위별 권장사항
 
@@ -725,8 +788,9 @@ carry, metrics_history = jax.lax.scan(
    - `train_out`이 None일 경우 처리
    - `torch.Tensor`, `np.ndarray` 타입 처리
 
-3. **CQL log_pi 처리**
-   - Stochastic policy의 경우 실제 log_pi 계산
+3. **CQL log_pi 처리** ✅ **완료됨**
+   - Stochastic policy의 경우 실제 log_pi 계산 (수정 완료)
+   - BC 단계에서 원래 CQL과 동일하게 log_prob 사용 (수정 완료)
 
 #### 중간 우선순위 (단기 개선)
 
