@@ -19,6 +19,15 @@ import wandb
 from torch.distributions import Normal
 from utils.policy_call import act_for_eval, get_action
 
+from .utils_pytorch import (
+    ReplayBuffer,
+    soft_update,
+    wrap_env,
+    set_seed,
+    wandb_init,
+    eval_actor,
+)
+
 # base batch size: 256
 # base learning rate: 3e-4
 @dataclass
@@ -65,113 +74,6 @@ class TrainConfig:
 TensorBatch = List[torch.Tensor]
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-        save_code=True,
-    )
-    wandb.run.save()
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    def scale_reward(reward):
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        raise NotImplementedError
 
 
 # SAC Actor & Critic implementation
@@ -472,26 +374,6 @@ class LBSAC:
         self.alpha = self.log_alpha.exp().detach()
 
 
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = act_for_eval(actor, state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.array(episode_rewards)
-
-
 @pyrallis.wrap()
 def train(config: TrainConfig):
     set_seed(config.train_seed, deterministic_torch=config.deterministic_torch)
@@ -566,9 +448,9 @@ def train(config: TrainConfig):
             eval_returns = eval_actor(
                 env=eval_env,
                 actor=actor,
+                device=config.device,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
-                device=config.device,
             )
             eval_log = {
                 "eval/reward_mean": np.mean(eval_returns),

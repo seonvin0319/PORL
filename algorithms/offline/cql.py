@@ -21,8 +21,20 @@ from torch.distributions import Normal, TanhTransform, TransformedDistribution
 TensorBatch = List[torch.Tensor]
 
 from utils.policy_call import act_for_eval, get_action, sample_actions_with_log_prob
+from algorithms.networks import TanhGaussianMLP, FullyConnectedQFunction, Scalar
 
-from .utils_pytorch import ActorConfig, action_for_loss
+from .utils_pytorch import (
+    ActorConfig,
+    action_for_loss,
+    ReplayBuffer,
+    soft_update,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+    set_seed,
+    wandb_init,
+    eval_actor,
+)
 
 
 @dataclass
@@ -81,147 +93,6 @@ class TrainConfig:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = act_for_eval(actor, state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -253,76 +124,6 @@ def modify_reward(
     dataset["rewards"] = dataset["rewards"] * reward_scale + reward_bias
 
 
-def extend_and_repeat(tensor: torch.Tensor, dim: int, repeat: int) -> torch.Tensor:
-    return tensor.unsqueeze(dim).repeat_interleave(repeat, dim=dim)
-
-
-def init_module_weights(module: torch.nn.Sequential, orthogonal_init: bool = False):
-    # Specific orthgonal initialization for inner layers
-    # If orthogonal init is off, we do not change default initialization
-    if orthogonal_init:
-        for submodule in module[:-1]:
-            if isinstance(submodule, nn.Linear):
-                nn.init.orthogonal_(submodule.weight, gain=np.sqrt(2))
-                nn.init.constant_(submodule.bias, 0.0)
-
-    # Lasy layers should be initialzied differently as well
-    if orthogonal_init:
-        nn.init.orthogonal_(module[-1].weight, gain=1e-2)
-    else:
-        nn.init.xavier_uniform_(module[-1].weight, gain=1e-2)
-
-    nn.init.constant_(module[-1].bias, 0.0)
-
-
-class ReparameterizedTanhGaussian(nn.Module):
-    def __init__(
-        self, log_std_min: float = -20.0, log_std_max: float = 2.0, no_tanh: bool = False
-    ):
-        super().__init__()
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        self.no_tanh = no_tanh
-
-    def log_prob(
-        self, mean: torch.Tensor, log_std: torch.Tensor, sample: torch.Tensor
-    ) -> torch.Tensor:
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
-        if self.no_tanh:
-            action_distribution = Normal(mean, std)
-        else:
-            action_distribution = TransformedDistribution(
-                Normal(mean, std), TanhTransform(cache_size=1)
-            )
-        return torch.sum(action_distribution.log_prob(sample), dim=-1)
-
-    def forward(
-        self, mean: torch.Tensor, log_std: torch.Tensor, deterministic: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
-
-        if self.no_tanh:
-            action_distribution = Normal(mean, std)
-        else:
-            action_distribution = TransformedDistribution(
-                Normal(mean, std), TanhTransform(cache_size=1)
-            )
-
-        if deterministic:
-            action_sample = torch.tanh(mean)
-        else:
-            action_sample = action_distribution.rsample()
-
-        log_prob = torch.sum(action_distribution.log_prob(action_sample), dim=-1)
-
-        return action_sample, log_prob
-
-
-from .networks import TanhGaussianMLP
-
-
 def TanhGaussianPolicy(
     state_dim: int,
     action_dim: int,
@@ -340,57 +141,6 @@ def TanhGaussianPolicy(
         log_std_offset=log_std_offset,
         cql_style=True, orthogonal_init=orthogonal_init,
     )
-
-
-class FullyConnectedQFunction(nn.Module):
-    def __init__(
-        self,
-        observation_dim: int,
-        action_dim: int,
-        orthogonal_init: bool = False,
-        n_hidden_layers: int = 3,
-    ):
-        super().__init__()
-        self.observation_dim = observation_dim
-        self.action_dim = action_dim
-        self.orthogonal_init = orthogonal_init
-
-        layers = [
-            nn.Linear(observation_dim + action_dim, 256),
-            nn.ReLU(),
-        ]
-        for _ in range(n_hidden_layers - 1):
-            layers.append(nn.Linear(256, 256))
-            layers.append(nn.ReLU())
-        layers.append(nn.Linear(256, 1))
-
-        self.network = nn.Sequential(*layers)
-
-        init_module_weights(self.network, orthogonal_init)
-
-    def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        multiple_actions = False
-        batch_size = observations.shape[0]
-        if actions.ndim == 3 and observations.ndim == 2:
-            multiple_actions = True
-            observations = extend_and_repeat(observations, 1, actions.shape[1]).reshape(
-                -1, observations.shape[-1]
-            )
-            actions = actions.reshape(-1, actions.shape[-1])
-        input_tensor = torch.cat([observations, actions], dim=-1)
-        q_values = torch.squeeze(self.network(input_tensor), dim=-1)
-        if multiple_actions:
-            q_values = q_values.reshape(batch_size, -1)
-        return q_values
-
-
-class Scalar(nn.Module):
-    def __init__(self, init_value: float):
-        super().__init__()
-        self.constant = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
-
-    def forward(self) -> nn.Parameter:
-        return self.constant
 
 
 class ContinuousCQL:
@@ -758,34 +508,25 @@ class ContinuousCQL:
         seed: Optional[int] = None,
     ) -> torch.Tensor:
         """Actor1+용 base loss (POGO multi-actor에서 호출). BC/CQL stage, alpha 처리."""
-        cfg = ActorConfig.from_actor(actor)
         obs, act = state, actions
-        if cfg.is_stochastic:
-            if hasattr(actor, "action_and_log_prob"):
-                new_a, log_pi = actor.action_and_log_prob(obs)
-                if log_pi is not None and log_pi.dim() > 1:
-                    log_pi = log_pi.squeeze(-1)
-                if log_pi is None:
-                    log_pi = torch.zeros(obs.size(0), device=obs.device)
-            elif cfg.is_gaussian and hasattr(actor, "get_mean_std"):
-                mean, std = actor.get_mean_std(obs)
-                log_std = torch.log(std.clamp(min=1e-6)).clamp(-20.0, 2.0)
-                std = torch.exp(log_std)
-                dist = torch.distributions.Normal(mean, std)
-                raw = dist.rsample()
-                tanh_a = torch.tanh(raw)
-                new_a = tanh_a * actor.max_action
-                log_pi = dist.log_prob(raw).sum(dim=-1) - torch.log(1 - tanh_a.pow(2) + 1e-6).sum(dim=-1)
-            else:
-                new_a = action_for_loss(actor, cfg, obs, seed=seed)
+        
+        # policy에서 직접 action과 log_prob 받기
+        if hasattr(actor, "action_and_log_prob"):
+            new_a, log_pi = actor.action_and_log_prob(obs)
+            if log_pi is not None and log_pi.dim() > 1:
+                log_pi = log_pi.squeeze(-1)
+            if log_pi is None:
                 log_pi = torch.zeros(obs.size(0), device=obs.device)
         else:
-            out = actor.forward(obs)
-            new_a = out[0] if isinstance(out, tuple) else out
+            # fallback: action만 얻고 log_prob는 0
+            from .utils_pytorch import ActorConfig, action_for_loss
+            cfg = ActorConfig.from_actor(actor)
+            new_a = action_for_loss(actor, cfg, obs, seed=seed)
             log_pi = torch.zeros(obs.size(0), device=obs.device)
 
         alpha_i, _ = self._alpha_and_alpha_loss(obs, log_pi)
         if self.total_it <= self.bc_steps:
+            # BC stage: alpha * log_pi(new_a) - log_prob(act)
             if hasattr(actor, "log_prob_actions"):
                 return (alpha_i * log_pi - actor.log_prob_actions(obs, act, keepdim=False)).mean()
             if hasattr(actor, "log_prob"):
@@ -794,6 +535,7 @@ class ContinuousCQL:
                     lp = lp.squeeze(-1)
                 return (alpha_i * log_pi - lp).mean()
             return ((new_a - act) ** 2).sum(dim=1).mean()
+        # CQL stage: alpha * log_pi(new_a) - Q(new_a)
         q_new = torch.min(self.critic_1(obs, new_a), self.critic_2(obs, new_a))
         return (alpha_i * log_pi - q_new).mean()
 

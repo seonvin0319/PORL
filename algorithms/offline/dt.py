@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, IterableDataset
 @dataclass
 class TrainConfig:
     # wandb params
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "DT-D4RL"
     name: str = "DT"
     # model params

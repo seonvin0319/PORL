@@ -16,11 +16,23 @@ import wandb
 TensorBatch = List[torch.Tensor]
 
 from utils.policy_call import act_for_eval, get_action
+from algorithms.networks import GaussianMLP
+
+from .utils_pytorch import (
+    ReplayBuffer,
+    soft_update,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+    set_seed,
+    wandb_init,
+    eval_actor,
+)
 
 
 @dataclass
 class TrainConfig:
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "AWAC-D4RL"
     name: str = "AWAC"
     checkpoints_path: Optional[str] = None
@@ -48,71 +60,6 @@ class TrainConfig:
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
-from .networks import GaussianMLP
-
 
 def Actor(
     state_dim: int,
@@ -152,11 +99,6 @@ class Critic(nn.Module):
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         q_value = self._mlp(torch.cat([state, action], dim=-1))
         return q_value
-
-
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
 class AdvantageWeightedActorCritic:
@@ -303,61 +245,6 @@ class AdvantageWeightedActorCritic:
         self._critic_2.load_state_dict(state_dict["critic_2"])
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    return env
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = act_for_eval(actor, state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
-
-
 def return_reward_range(dataset, max_episode_steps):
     returns, lengths = [], []
     ep_ret, ep_len = 0.0, 0
@@ -380,17 +267,6 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
         dataset["rewards"] *= max_episode_steps
     elif "antmaze" in env_name:
         dataset["rewards"] -= 1.0
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
 
 
 @pyrallis.wrap()

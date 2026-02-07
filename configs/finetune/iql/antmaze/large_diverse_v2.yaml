@@ -18,7 +18,7 @@ name: IQL_antmaze-large-diverse-v2
 normalize: true
 normalize_reward: true
 qf_lr: 3e-4
-project: CORL
+project: PORL
 seed: 0
 tau: 0.005
 vf_lr: 3e-4

@@ -53,6 +53,6 @@ eval_episodes: 10
 eval_every: 5
 
 # Wandb
-project: CORL
+project: PORL
 group: pogo-multi-rebrac
 name: pogo-multi-rebrac

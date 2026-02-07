@@ -68,7 +68,7 @@ class TrainConfig:
     mixing_ratio: float = 0.5  # Data mixing ratio for online tuning
     is_sparse_reward: bool = False  # Use sparse reward
     # Wandb logging
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "Cal-QL-D4RL"
     name: str = "Cal-QL"
 

@@ -64,7 +64,7 @@ class TrainConfig:
     normalize_reward: bool = True  # Normalize reward
     online_discount: float = 0.995  # Discount for online tuning
     # Wandb logging
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "SPOT-D4RL"
     name: str = "SPOT"
 

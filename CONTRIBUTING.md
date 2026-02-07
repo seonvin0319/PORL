@@ -69,13 +69,13 @@ Use these conventions to name your runs in the configs:
 3. use our [\_\_post_init\_\_](https://github.com/tinkoff-ai/CORL/blob/962688b405f579a1ce6ec1b57e6369aaf76f9e69/algorithms/offline/awac.py#L48) implementation in your config dataclass
 
 Since we are releasing wandb logs for all algorithms, you will need to submit multiseed (~4 seeds) 
-training runs the `CORL` project in the wandb [corl-team](https://wandb.ai/corl-team) organization. We'll invite you there when the time will come.
+training runs the `PORL` project in the wandb [corl-team](https://wandb.ai/corl-team) organization. We'll invite you there when the time will come.
 
 We usually use wandb sweeps for this. You can use this example config (it will work with pyrallis as it expects `config_path` cli argument):
 ```yaml
 # sweep_config.yaml
 entity: corl-team
-project: CORL
+project: PORL
 program: algorithms/contrib/<algo_name>.py
 method: grid
 parameters:

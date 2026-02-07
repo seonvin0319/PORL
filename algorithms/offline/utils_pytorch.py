@@ -202,6 +202,12 @@ class ReplayBuffer:
 # 공통 유틸리티 함수들
 # ============================================================================
 
+def soft_update(target: nn.Module, source: nn.Module, tau: float):
+    """Soft update target network parameters"""
+    for target_param, source_param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
+
+
 def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):

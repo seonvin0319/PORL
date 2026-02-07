@@ -20,7 +20,7 @@ ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
 
 @dataclass
 class TrainConfig:
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "AWAC-D4RL"
     name: str = "AWAC"
     checkpoints_path: Optional[str] = None

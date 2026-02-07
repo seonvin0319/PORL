@@ -14,7 +14,7 @@ n_test_episodes: 100
 normalize_reward: true
 offline_iterations: 1000000
 online_iterations: 1000000
-project: CORL
+project: PORL
 seed: 42
 tau: 0.005
 test_seed: 69

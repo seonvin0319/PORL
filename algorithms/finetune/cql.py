@@ -66,7 +66,7 @@ class TrainConfig:
     reward_scale: float = 1.0  # Reward scale for normalization
     reward_bias: float = 0.0  # Reward bias for normalization
     # Wandb logging
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "CQL-D4RL"
     name: str = "CQL"
 

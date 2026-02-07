@@ -29,7 +29,7 @@ online_discount: 0.99
 online_iterations: 1000000
 policy_freq: 2
 policy_noise: 0.2
-project: CORL
+project: PORL
 seed: 0
 tau: 0.005
 vae_hidden_dim: 750

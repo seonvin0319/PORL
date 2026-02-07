@@ -25,11 +25,12 @@ from geomloss import SamplesLoss
 # 각 알고리즘 import
 from .iql import ImplicitQLearning, TwinQ, ValueFunction, GaussianPolicy, DeterministicPolicy
 from .td3_bc import TD3_BC, Actor, Critic
-from .cql import ContinuousCQL, TanhGaussianPolicy, FullyConnectedQFunction, Scalar
-from .awac import AdvantageWeightedActorCritic, soft_update
+from .cql import ContinuousCQL, TanhGaussianPolicy
+from .awac import AdvantageWeightedActorCritic
+from .utils_pytorch import soft_update
 from .sac_n import SACN, Actor as SACNActor, VectorizedCritic
 from .edac import EDAC, Actor as EDACActor
-from .networks import BaseActor, DeterministicMLP, StochasticMLP, GaussianMLP, TanhGaussianMLP
+from algorithms.networks import BaseActor, DeterministicMLP, StochasticMLP, GaussianMLP, TanhGaussianMLP
 from .utils_pytorch import ActorConfig, action_for_loss
 from utils.policy_call import get_action, act_for_eval, sample_K_actions
 
@@ -829,6 +830,7 @@ def train(config: TrainConfig):
             )
 
     elif config.algorithm == "cql":
+        from algorithms.networks import FullyConnectedQFunction
         def _cql_actor0():
             a = TanhGaussianPolicy(state_dim, action_dim, max_action)
             return a, True, False

@@ -58,7 +58,7 @@ class TrainConfig:
     qf_lr: float = 3e-4  # Critic learning rate
     actor_lr: float = 3e-4  # Actor learning rate
     # Wandb logging
-    project: str = "CORL"
+    project: str = "PORL"
     group: str = "IQL-D4RL"
     name: str = "IQL"
 

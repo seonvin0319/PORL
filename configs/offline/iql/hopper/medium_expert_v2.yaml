@@ -16,7 +16,7 @@ n_episodes: 10
 name: IQL
 normalize: true
 normalize_reward: false
-project: CORL
+project: PORL
 qf_lr: 3e-4
 seed: 0
 tau: 0.005

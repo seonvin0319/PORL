@@ -33,6 +33,6 @@ buffer_size: 2000000
 normalize: true
 normalize_reward: false
 
-project: CORL
+project: PORL
 group: pogo-multi-cql
 name: pogo-multi-cql

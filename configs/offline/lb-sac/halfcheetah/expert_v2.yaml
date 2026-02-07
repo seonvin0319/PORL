@@ -21,6 +21,6 @@ name: "LB-SAC"
 num_critics: 6
 num_epochs: 350
 num_updates_on_epoch: 1000
-project: "CORL"
+project: "PORL"
 tau: 0.005
 train_seed: 10
