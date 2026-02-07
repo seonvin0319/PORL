@@ -268,6 +268,9 @@ class ImplicitQLearning:
         if hasattr(self.actor, "log_prob_actions"):
             lp = self.actor.log_prob_actions(observations, actions)
             bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
+        elif hasattr(self.actor, "log_prob_actions"):
+            lp = self.actor.log_prob_actions(observations, actions)
+            bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
         else:
             policy_out = self.actor(observations)
             if isinstance(policy_out, torch.distributions.Distribution):

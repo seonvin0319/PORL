@@ -282,7 +282,7 @@ class GaussianMLP(BasePolicyMLP):
         return actions
 
     def log_prob_actions(
-        self, states: torch.Tensor, actions: torch.Tensor
+        self, states: torch.Tensor, actions: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """Return [B] - shape 통일 (내부에서 squeeze)"""
         mean, std = self.get_mean_std(states)
@@ -457,7 +457,7 @@ class TanhGaussianMLP(BasePolicyMLP):
         return actions
 
     def log_prob_actions(
-        self, states: torch.Tensor, actions: torch.Tensor
+        self, states: torch.Tensor, actions: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         """Return [B] - shape 통일 (내부에서 squeeze)"""
         mean, log_std = self._get_mean_logstd(states)

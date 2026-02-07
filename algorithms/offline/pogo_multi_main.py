@@ -47,6 +47,8 @@ class TrainConfig:
     eval_freq: int = int(5e3)
     n_episodes: int = 10
     max_timesteps: int = int(1e6)
+    final_eval_runs: int = 5
+    final_eval_episodes: int = 10
     checkpoints_path: Optional[str] = None
     load_model: str = ""
 
@@ -83,6 +85,7 @@ class TrainConfig:
     # CQL
     cql_alpha: float = 10.0
     cql_n_actions: int = 10
+    bc_steps: int = 100000
     target_entropy: Optional[float] = None
     
     # AWAC
@@ -508,6 +511,135 @@ def _train_multi_actor(
     return log_dict
 
 
+def _merge_algorithm_config_from_env(config: TrainConfig) -> None:
+    """configs/offline/{algorithm}/{env}/{task}.yaml에서 Actor0 파라미터 로드"""
+    if config.algorithm not in ("iql", "awac", "cql", "td3_bc", "sac_n", "edac"):
+        return
+    env_dir, task = _parse_env_name(config.env)
+    algo_config_path = Path("configs/offline") / config.algorithm / env_dir / f"{task}.yaml"
+    if not algo_config_path.exists():
+        return
+    import yaml
+    with open(algo_config_path) as f:
+        algo_cfg = yaml.safe_load(f)
+    if algo_cfg is None:
+        return
+
+    def _f(x):
+        """YAML에서 3e-4 등이 str로 로드될 수 있으므로 float 변환"""
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            try:
+                return float(x)
+            except ValueError:
+                pass
+        return x
+
+    # 공통
+    if "batch_size" in algo_cfg:
+        config.batch_size = int(algo_cfg["batch_size"])
+    if "discount" in algo_cfg:
+        config.discount = _f(algo_cfg["discount"])
+    elif "gamma" in algo_cfg:
+        config.discount = _f(algo_cfg["gamma"])
+    if "tau" in algo_cfg:
+        config.tau = _f(algo_cfg["tau"])
+    if "buffer_size" in algo_cfg:
+        config.buffer_size = int(algo_cfg["buffer_size"])
+    if "normalize" in algo_cfg:
+        config.normalize = algo_cfg["normalize"]
+
+    # IQL
+    if config.algorithm == "iql":
+        if "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "qf_lr" in algo_cfg:
+            config.qf_lr = _f(algo_cfg["qf_lr"])
+        if "vf_lr" in algo_cfg:
+            config.vf_lr = _f(algo_cfg["vf_lr"])
+        if "beta" in algo_cfg:
+            config.beta = _f(algo_cfg["beta"])
+        if "iql_tau" in algo_cfg:
+            config.iql_tau = _f(algo_cfg["iql_tau"])
+        if "iql_deterministic" in algo_cfg:
+            config.iql_deterministic = algo_cfg["iql_deterministic"]
+        if "actor_dropout" in algo_cfg:
+            config.actor_dropout = algo_cfg["actor_dropout"]
+
+    # AWAC
+    elif config.algorithm == "awac":
+        if "learning_rate" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["learning_rate"])
+        elif "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "awac_lambda" in algo_cfg:
+            config.awac_lambda = _f(algo_cfg["awac_lambda"])
+        if "exp_adv_max" in algo_cfg:
+            config.exp_adv_max = _f(algo_cfg["exp_adv_max"])
+
+    # CQL
+    elif config.algorithm == "cql":
+        if "cql_alpha" in algo_cfg:
+            config.cql_alpha = _f(algo_cfg["cql_alpha"])
+        if "cql_n_actions" in algo_cfg:
+            config.cql_n_actions = int(algo_cfg["cql_n_actions"])
+        if "bc_steps" in algo_cfg:
+            config.bc_steps = int(algo_cfg["bc_steps"])
+        if "qf_lr" in algo_cfg:
+            config.qf_lr = _f(algo_cfg["qf_lr"])
+        if "policy_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["policy_lr"])
+        elif "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "soft_target_update_rate" in algo_cfg:
+            config.tau = _f(algo_cfg["soft_target_update_rate"])
+        if "target_entropy" in algo_cfg and algo_cfg["target_entropy"] is not None:
+            config.target_entropy = _f(algo_cfg["target_entropy"])
+    # TD3_BC
+    elif config.algorithm == "td3_bc":
+        if "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "qf_lr" in algo_cfg:
+            config.qf_lr = _f(algo_cfg["qf_lr"])
+        if "alpha" in algo_cfg:
+            config.alpha = _f(algo_cfg["alpha"])
+        if "policy_noise" in algo_cfg:
+            config.policy_noise = _f(algo_cfg["policy_noise"])
+        if "noise_clip" in algo_cfg:
+            config.noise_clip = _f(algo_cfg["noise_clip"])
+        if "policy_freq" in algo_cfg:
+            config.policy_freq = int(algo_cfg["policy_freq"])
+
+    # SAC-N
+    elif config.algorithm == "sac_n":
+        if "actor_learning_rate" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_learning_rate"])
+        elif "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "alpha_learning_rate" in algo_cfg:
+            config.alpha_learning_rate = _f(algo_cfg["alpha_learning_rate"])
+        if "critic_learning_rate" in algo_cfg:
+            config.qf_lr = _f(algo_cfg["critic_learning_rate"])
+        if "num_critics" in algo_cfg:
+            config.num_critics = int(algo_cfg["num_critics"])
+
+    # EDAC
+    elif config.algorithm == "edac":
+        if "actor_learning_rate" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_learning_rate"])
+        elif "actor_lr" in algo_cfg:
+            config.actor_lr = _f(algo_cfg["actor_lr"])
+        if "alpha_learning_rate" in algo_cfg:
+            config.alpha_learning_rate = _f(algo_cfg["alpha_learning_rate"])
+        if "critic_learning_rate" in algo_cfg:
+            config.qf_lr = _f(algo_cfg["critic_learning_rate"])
+        if "num_critics" in algo_cfg:
+            config.num_critics = int(algo_cfg["num_critics"])
+        if "eta" in algo_cfg:
+            config.eta = _f(algo_cfg["eta"])
+
+
 def _parse_env_name(env_name: str) -> Tuple[str, str]:
     """환경 이름을 파싱하여 (env, task) 반환
     예: 'halfcheetah-medium-v2' -> ('halfcheetah', 'medium_v2')
@@ -602,9 +734,10 @@ def _create_config_file(config: TrainConfig) -> str:
             f.write(f"noise_clip: {config.noise_clip}\n")
             f.write(f"policy_freq: {config.policy_freq}\n\n")
         elif config.algorithm == "cql":
-            f.write("# CQL 파라미터\n")
+            f.write("# CQL 파라미터 (configs/offline/cql에서 merge됨)\n")
             f.write(f"cql_alpha: {config.cql_alpha}\n")
             f.write(f"cql_n_actions: {config.cql_n_actions}\n")
+            f.write(f"bc_steps: {config.bc_steps}\n")
             f.write(f"target_entropy: {config.target_entropy if config.target_entropy is not None else 'null'}\n")
             f.write(f"qf_lr: {config.qf_lr}\n")
             f.write(f"actor_lr: {config.actor_lr}\n\n")
@@ -697,6 +830,9 @@ def train(config: TrainConfig):
     print(f"Environment: {config.env}", flush=True)
     print("=" * 60, flush=True)
     print()
+
+    # configs/offline/{algorithm}/{env}/{task}.yaml에서 Actor0 파라미터 merge
+    _merge_algorithm_config_from_env(config)
 
     # Seed 설정 (모든 랜덤 소스 초기화)
     # 환경 생성 전에 seed 설정하여 완전한 재현성 보장
@@ -892,7 +1028,7 @@ def train(config: TrainConfig):
             policy_lr=config.actor_lr,
             qf_lr=config.qf_lr,
             soft_target_update_rate=config.tau,
-            bc_steps=100000,
+            bc_steps=config.bc_steps,
             target_update_period=1,
             cql_n_actions=config.cql_n_actions,
             cql_importance_sample=True,
@@ -1203,15 +1339,61 @@ def train(config: TrainConfig):
     print("=" * 60, flush=True)
     save_checkpoint(config.max_timesteps, "_final")
     
-    # 학습 완료 후 최종 평가
+    # 학습 완료 후 최종 평가 (POGO 형식: runs x episodes)
+    # actor 모드 무관히 deterministic + stochastic 둘 다 평가
     print("\n" + "=" * 60, flush=True)
-    print("======== Final Evaluation (trained weights) ========", flush=True)
+    print("======== Final Evaluation (all actors) ========", flush=True)
     print("=" * 60, flush=True)
+    final_eval_results = {}
     for i in range(config.num_actors):
-        if evaluations[i]:
-            final_score = evaluations[i][-1]
-            best_score = max(evaluations[i])
-            print(f"[FINAL] Actor {i}: Final={final_score:.1f}, Best={best_score:.1f}", flush=True)
+        print(f"\n======== Final Evaluation: Actor {i} ========", flush=True)
+        actor_i = actors[i]
+        det_scores, stoch_scores = [], []
+        for r in range(config.final_eval_runs):
+            base_seed = config.seed + 10000 + i * 1000 + r * 100
+            actor_i.eval()
+            for det_mode in [True, False]:
+                ep_rewards = []
+                for ep in range(config.final_eval_episodes):
+                    ep_seed = base_seed + (100 if det_mode else 200) + ep
+                    try:
+                        env.seed(ep_seed)
+                        env.action_space.seed(ep_seed)
+                    except Exception:
+                        pass
+                    state, done = env.reset(), False
+                    if isinstance(state, tuple):
+                        state = state[0]
+                    ep_ret = 0.0
+                    step_count = 0
+                    while not done:
+                        step_seed = ep_seed + step_count if not det_mode else None
+                        action = act_for_eval(
+                            actor_i, state, config.device,
+                            deterministic=det_mode,
+                            seed=step_seed,
+                        )
+                        step_out = env.step(action)
+                        if len(step_out) == 5:
+                            state, reward, terminated, truncated, _ = step_out
+                            done = terminated or truncated
+                        else:
+                            state, reward, done, _ = step_out
+                        ep_ret += reward
+                        step_count += 1
+                    ep_rewards.append(ep_ret)
+                scores = np.asarray(ep_rewards)
+                norm_score = env.get_normalized_score(scores.mean()) * 100.0
+                if det_mode:
+                    det_scores.append(norm_score)
+                else:
+                    stoch_scores.append(norm_score)
+        actor_i.train()
+        det_scores = np.array(det_scores, dtype=np.float32) if det_scores else np.array([0.0])
+        stoch_scores = np.array(stoch_scores, dtype=np.float32) if stoch_scores else np.array([0.0])
+        print(f"[FINAL] Deterministic: mean={det_scores.mean():.3f}, std={det_scores.std():.3f} over {config.final_eval_runs}x{config.final_eval_episodes}", flush=True)
+        print(f"[FINAL] Stochastic:   mean={stoch_scores.mean():.3f}, std={stoch_scores.std():.3f} over {config.final_eval_runs}x{config.final_eval_episodes}", flush=True)
+        final_eval_results[i] = {"det_mean": float(det_scores.mean()), "det_std": float(det_scores.std()), "stoch_mean": float(stoch_scores.mean()), "stoch_std": float(stoch_scores.std())}
     
     # 로그 저장: results/{algorithm}/{env}/{task}/seed_{seed}/logs/
     import json
@@ -1233,6 +1415,7 @@ def train(config: TrainConfig):
         "evaluations": {str(i): evaluations[i] for i in range(config.num_actors)},
         "final_scores": {str(i): evaluations[i][-1] if evaluations[i] else None for i in range(config.num_actors)},
         "best_scores": {str(i): max(evaluations[i]) if evaluations[i] else None for i in range(config.num_actors)},
+        "final_eval": {str(i): final_eval_results.get(i, {}) for i in range(config.num_actors)},
     }
     
     with open(log_file, "w") as f:

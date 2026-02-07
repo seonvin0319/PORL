@@ -25,14 +25,8 @@ sinkhorn_K: 4
 sinkhorn_blur: 0.05
 sinkhorn_backend: "tensorized"
 
-# IQL 파라미터 (IQL 구조 그대로 사용)
-iql_tau: 0.7
-beta: 3.0
-vf_lr: 3e-4
-qf_lr: 3e-4
-actor_lr: 3e-4
-iql_deterministic: false
-actor_dropout: null
+# IQL 파라미터: configs/offline/iql/{env}/{task}.yaml에서 자동 로드
+# (iql_tau, beta, vf_lr, qf_lr, actor_lr 등)
 
 # 공통
 batch_size: 256

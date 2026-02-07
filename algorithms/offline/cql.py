@@ -252,6 +252,8 @@ class ContinuousCQL:
     ) -> torch.Tensor:
         if self.total_it <= self.bc_steps:
             log_probs = self.actor.log_prob_actions(observations, actions)
+            if log_probs.dim() > 1:
+                log_probs = log_probs.squeeze(-1)
             policy_loss = (alpha * log_pi - log_probs).mean()
         else:
             q_new_actions = torch.min(
@@ -541,8 +543,15 @@ class ContinuousCQL:
                 raise ValueError("CQL compute_energy_function requires actions in BC stage")
             act = actions
             if hasattr(actor, "log_prob_actions"):
-                return (alpha_i * log_pi - actor.log_prob_actions(obs, act)).mean()
-            # Fallback: use MSE if log_prob_actions is not available
+                lp = actor.log_prob_actions(obs, act)
+                if lp.dim() > 1:
+                    lp = lp.squeeze(-1)
+                return (alpha_i * log_pi - lp).mean()
+            if hasattr(actor, "log_prob"):
+                lp = actor.log_prob(obs, act)
+                if lp.dim() > 1:
+                    lp = lp.squeeze(-1)
+                return (alpha_i * log_pi - lp).mean()
             return ((new_a - act) ** 2).sum(dim=1).mean()
         # CQL stage: alpha * log_pi(new_a) - Q(new_a)
         q_new = torch.min(self.critic_1(obs, new_a), self.critic_2(obs, new_a))
@@ -648,7 +657,12 @@ def train(config: TrainConfig):
         config.orthogonal_init,
         config.q_n_hidden_layers,
     ).to(config.device)
-    critic_2 = FullyConnectedQFunction(state_dim, action_dim, config.orthogonal_init).to(
+    critic_2 = FullyConnectedQFunction(
+        state_dim,
+        action_dim,
+        config.orthogonal_init,
+        config.q_n_hidden_layers,
+    ).to(
         config.device
     )
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
