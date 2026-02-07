@@ -20,7 +20,7 @@ from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
 TensorBatch = List[torch.Tensor]
 
-from utils.policy_call import act_for_eval, get_action, sample_actions_with_log_prob
+from algorithms.networks import act_for_eval, get_action, sample_actions_with_log_prob
 from algorithms.networks import TanhGaussianMLP, FullyConnectedQFunction, Scalar
 
 from .utils_pytorch import (
@@ -500,15 +500,25 @@ class ContinuousCQL:
 
         return log_dict
 
-    def compute_actor_base_loss(
+    def compute_energy_function(
         self,
         actor: nn.Module,
         state: torch.Tensor,
-        actions: torch.Tensor,
+        actions: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
     ) -> torch.Tensor:
-        """Actor1+용 base loss (POGO multi-actor에서 호출). BC/CQL stage, alpha 처리."""
-        obs, act = state, actions
+        """Energy function (POGO multi-actor Actor1+용). BC/CQL stage, alpha 처리.
+        
+        Args:
+            actor: Actor network
+            state: [B, state_dim]
+            actions: [B, action_dim] (BC stage에서 사용)
+            seed: Random seed
+        
+        Returns:
+            energy: [B] -> scalar (mean)
+        """
+        obs = state
         
         # policy에서 직접 action과 log_prob 받기
         if hasattr(actor, "action_and_log_prob"):
@@ -527,6 +537,9 @@ class ContinuousCQL:
         alpha_i, _ = self._alpha_and_alpha_loss(obs, log_pi)
         if self.total_it <= self.bc_steps:
             # BC stage: alpha * log_pi(new_a) - log_prob(act)
+            if actions is None:
+                raise ValueError("CQL compute_energy_function requires actions in BC stage")
+            act = actions
             if hasattr(actor, "log_prob_actions"):
                 return (alpha_i * log_pi - actor.log_prob_actions(obs, act, keepdim=False)).mean()
             if hasattr(actor, "log_prob"):

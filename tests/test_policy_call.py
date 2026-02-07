@@ -16,7 +16,7 @@ from algorithms.offline.pogo_policies import (
     StochasticMLP,
     TanhGaussianMLP,
 )
-from utils.policy_call import act_for_eval, get_action, sample_actions
+from algorithms.networks import act_for_eval, get_action, sample_actions
 
 
 def test_get_action_deterministic():

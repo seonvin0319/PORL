@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from algorithms.offline.pogo_policies import GaussianMLP, TanhGaussianMLP
-from utils.policy_call import get_action, sample_K_actions
+from algorithms.networks import get_action, sample_K_actions
 
 
 def test_action_and_log_prob_shape():

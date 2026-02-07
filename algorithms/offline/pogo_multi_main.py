@@ -4,6 +4,7 @@
 # Config에서 algorithm 선택 가능
 
 import copy
+import inspect
 import os
 import random
 import sys
@@ -32,7 +33,7 @@ from .sac_n import SACN, Actor as SACNActor, VectorizedCritic
 from .edac import EDAC, Actor as EDACActor
 from algorithms.networks import BaseActor, DeterministicMLP, StochasticMLP, GaussianMLP, TanhGaussianMLP
 from .utils_pytorch import ActorConfig, action_for_loss
-from utils.policy_call import get_action, act_for_eval, sample_K_actions
+from algorithms.networks import get_action, act_for_eval, sample_K_actions
 
 TensorBatch = List[torch.Tensor]
 
@@ -87,6 +88,9 @@ class TrainConfig:
     # AWAC
     awac_lambda: float = 1.0
     exp_adv_max: float = 100.0
+    
+    # Energy function 설정 (IQL/AWAC용)
+    energy_function_type: str = "q"  # "q" 또는 "advantage" (IQL/AWAC만 해당)
     
     # SAC-N
     num_critics: int = 10
@@ -368,25 +372,23 @@ def _compute_w2_distance(
 
 
 def _compute_actor_loss_with_w2(
-    base_loss_fn: Callable[[nn.Module], torch.Tensor],
+    energy_fn: Callable[[nn.Module], torch.Tensor],
     actor_i_config: ActorConfig,
-    ref_actor_config: Optional[ActorConfig],
+    ref_actor_config: ActorConfig,
     states: torch.Tensor,
     w2_weight: float,
     sinkhorn_K: int = 4,
     sinkhorn_blur: float = 0.05,
     sinkhorn_loss=None,
     seed: Optional[int] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    공통 multi-actor loss 계산 함수 (JAX 버전과 일관성 유지)
-    Actor0: base loss만 사용
-    Actor1+: base loss + w2_weight * w2_distance
+    Actor1+용 loss 계산 함수: energy function + w2_weight * w2_distance
     
     Args:
-        base_loss_fn: Base loss 계산 함수
+        energy_fn: Energy function 계산 함수
         actor_i_config: 현재 actor 설정
-        ref_actor_config: 참조 actor 설정 (Actor0인 경우 None)
+        ref_actor_config: 참조 actor 설정 (이전 actor)
         states: [B, state_dim]
         w2_weight: W2 distance 가중치
         sinkhorn_K: 샘플 수
@@ -396,15 +398,12 @@ def _compute_actor_loss_with_w2(
     
     Returns:
         actor_loss: 계산된 loss
-        w2_distance: W2 distance (Actor0인 경우 None)
+        w2_distance: W2 distance
     """
-    base_loss = base_loss_fn(actor_i_config.actor)
+    # Energy function 계산
+    energy = energy_fn(actor_i_config.actor)
     
-    if ref_actor_config is None:
-        # Actor0: W2 penalty 없음
-        return base_loss, None
-    
-    # Actor1+: W2 distance 계산
+    # W2 distance 계산
     w2_distance = _compute_w2_distance(
         actor_i_config=actor_i_config,
         ref_actor_config=ref_actor_config,
@@ -415,7 +414,7 @@ def _compute_actor_loss_with_w2(
         seed=seed,
     )
     
-    return base_loss + w2_weight * w2_distance, w2_distance
+    return energy + w2_weight * w2_distance, w2_distance
 
 
 def _train_multi_actor(
@@ -435,6 +434,7 @@ def _train_multi_actor(
     *,
     call_trainer_update_target_network: bool = False,
     target_update_period: Optional[int] = None,
+    energy_function_type: str = "q",
 ) -> Dict[str, float]:
     """통합 multi-actor train: trainer.train/update + Actor1+ W2.
     Target update (boolean으로 명시):
@@ -457,14 +457,25 @@ def _train_multi_actor(
 
     if trainer.total_it % policy_freq == 0:
         for i in range(1, len(actors)):
-            def base_loss_fn(actor, idx=i):
-                return trainer.compute_actor_base_loss(actor, state, actions, seed=seed_base + 100 + idx)
+            # Energy function 생성 (Actor1+용, 모든 알고리즘에서 필수)
+            def energy_fn(actor, idx=i):
+                sig = inspect.signature(trainer.compute_energy_function)
+                kwargs = {
+                    "actor": actor,
+                    "state": state,
+                    "actions": actions,
+                    "seed": seed_base + 100 + idx,
+                }
+                # IQL/AWAC만 energy_type 파라미터 사용
+                if "energy_type" in sig.parameters:
+                    kwargs["energy_type"] = energy_function_type
+                return trainer.compute_energy_function(**kwargs)
 
             actor_i_config = ActorConfig.from_actor(actors[i])
             ref_actor_config = ActorConfig.from_actor(actors[i - 1])
             w2_weight_i = w2_weights[i - 1]
             actor_loss_i, w2_i = _compute_actor_loss_with_w2(
-                base_loss_fn=base_loss_fn,
+                energy_fn=energy_fn,
                 actor_i_config=actor_i_config,
                 ref_actor_config=ref_actor_config,
                 states=state,
@@ -792,6 +803,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     elif config.algorithm == "td3_bc":
@@ -839,6 +851,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     elif config.algorithm == "cql":
@@ -902,6 +915,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     elif config.algorithm == "awac":
@@ -947,6 +961,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     elif config.algorithm == "sac_n":
@@ -987,6 +1002,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     elif config.algorithm == "edac":
@@ -1028,6 +1044,7 @@ def train(config: TrainConfig):
                 config.sinkhorn_backend, batch, sinkhorn_loss, seed_base,
                 call_trainer_update_target_network=False,
                 target_update_period=None,
+                energy_function_type=config.energy_function_type,
             )
 
     else:
@@ -1129,10 +1146,14 @@ def train(config: TrainConfig):
                     if isinstance(state, tuple):
                         state = state[0]
                     ep_ret = 0.0
+                    step_count = 0
                     while not done:
+                        # 각 step마다 다른 seed 사용 (재현성 보장)
+                        step_seed = episode_seed + step_count if not use_deterministic_eval else None
                         action = act_for_eval(
                             actor_i, state, config.device,
                             deterministic=use_deterministic_eval,
+                            seed=step_seed,
                         )
                         step_out = env.step(action)
                         if len(step_out) == 5:
@@ -1141,6 +1162,7 @@ def train(config: TrainConfig):
                         else:
                             state, reward, done, _ = step_out
                         ep_ret += reward
+                        step_count += 1
                     episode_rewards.append(ep_ret)
                 actor_i.train()
                 scores = np.asarray(episode_rewards)

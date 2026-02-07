@@ -15,7 +15,7 @@ import torch.nn.functional
 import wandb
 TensorBatch = List[torch.Tensor]
 
-from utils.policy_call import act_for_eval, get_action
+from algorithms.networks import act_for_eval, get_action
 from algorithms.networks import GaussianMLP
 
 from .utils_pytorch import (
@@ -195,42 +195,44 @@ class AdvantageWeightedActorCritic:
         result = {"critic_loss": critic_loss, "actor_loss": actor_loss}
         return result
 
-    def compute_actor_base_loss(
-        self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None
+    def compute_energy_function(
+        self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None, energy_type: str = "q"
     ) -> torch.Tensor:
-        """Actor1+용 base loss: Actor0와 동일한 advantage-weighted BC (POGO multi-actor에서 호출)"""
-        if actions is None:
-            raise ValueError("AWAC compute_actor_base_loss requires actions")
-        from .utils_pytorch import ActorConfig, action_for_loss
-        cfg = ActorConfig.from_actor(actor)
-
-        with torch.no_grad():
-            if hasattr(actor, "deterministic_actions"):
-                pi_det = actor.deterministic_actions(state)
-            elif hasattr(actor, "get_mean_std"):
-                pi_det = actor.get_mean_std(state)[0]
-            else:
-                out = actor(state)
-                pi_det = out[0] if isinstance(out, (tuple, list)) else out
-            v = torch.min(self._critic_1(state, pi_det), self._critic_2(state, pi_det))
-            q = torch.min(self._critic_1(state, actions), self._critic_2(state, actions))
-            adv = q - v
-            weights = torch.clamp_max(
-                torch.exp(adv / self._awac_lambda), self._exp_adv_max
-            )
-
-        if hasattr(actor, "log_prob"):
-            action_log_prob = actor.log_prob(state, actions)
-        elif hasattr(actor, "log_prob_actions"):
-            action_log_prob = actor.log_prob_actions(state, actions, keepdim=False)
+        """Energy function: -Q 또는 -A (POGO multi-actor Actor1+용)
+        
+        Args:
+            actor: Actor network
+            state: [B, state_dim]
+            actions: [B, action_dim] (energy_type="advantage"일 때 사용)
+            seed: Random seed
+            energy_type: "q" 또는 "advantage"
+        
+        Returns:
+            energy: [B] -> scalar (mean)
+        """
+        from algorithms.networks import get_action
+        
+        if energy_type == "advantage":
+            # -A: -advantage
+            if actions is None:
+                raise ValueError("AWAC compute_energy_function with advantage requires actions")
+            with torch.no_grad():
+                if hasattr(actor, "deterministic_actions"):
+                    pi_det = actor.deterministic_actions(state)
+                elif hasattr(actor, "get_mean_std"):
+                    pi_det = actor.get_mean_std(state)[0]
+                else:
+                    out = actor(state)
+                    pi_det = out[0] if isinstance(out, (tuple, list)) else out
+                v = torch.min(self._critic_1(state, pi_det), self._critic_2(state, pi_det))
+                q = torch.min(self._critic_1(state, actions), self._critic_2(state, actions))
+                adv = q - v
+            return -adv.mean()
         else:
-            pi = action_for_loss(actor, cfg, state, seed=seed)
-            bc_losses = ((pi - actions) ** 2).sum(dim=1)
-            return (weights * bc_losses).mean()
-
-        if action_log_prob.dim() > 1:
-            action_log_prob = action_log_prob.squeeze(-1)
-        return (-action_log_prob * weights).mean()
+            # -Q: -Q(state, pi(state))
+            pi_i, _ = get_action(actor, state, deterministic=False, need_log_prob=False)
+            q_value = torch.min(self._critic_1(state, pi_i), self._critic_2(state, pi_i))
+            return -q_value.mean()
 
     def state_dict(self) -> Dict[str, Any]:
         return {

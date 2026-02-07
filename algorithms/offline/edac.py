@@ -16,7 +16,7 @@ import pyrallis
 import torch
 import torch.nn as nn
 import wandb
-from utils.policy_call import act_for_eval, get_action
+from algorithms.networks import act_for_eval, get_action
 
 TensorBatch = List[torch.Tensor]
 from algorithms.networks import TanhGaussianMLP
@@ -207,10 +207,20 @@ class EDAC:
 
         return loss, batch_entropy, q_value_std
 
-    def compute_actor_base_loss(
+    def compute_energy_function(
         self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None
     ) -> torch.Tensor:
-        """Actor1+용 base loss: alpha*log_pi - Q_min (POGO multi-actor에서 호출)"""
+        """Energy function: alpha*log_pi - Q_min (POGO multi-actor Actor1+용)
+        
+        Args:
+            actor: Actor network
+            state: [B, state_dim]
+            actions: Not used
+            seed: Random seed
+        
+        Returns:
+            energy: [B] -> scalar (mean)
+        """
         pi_i, log_pi_i = get_action(actor, state, deterministic=False, need_log_prob=True)
         if log_pi_i is None:
             log_pi_i = torch.zeros(state.size(0), device=state.device)

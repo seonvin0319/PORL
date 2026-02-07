@@ -22,6 +22,13 @@ from .critics import (
     VectorizedLinear,
     Squeeze,
 )
+from .policy_call import (
+    get_action,
+    act_for_eval,
+    sample_actions,
+    sample_K_actions,
+    sample_actions_with_log_prob,
+)
 
 __all__ = [
     # Protocols
@@ -48,4 +55,10 @@ __all__ = [
     "EnsembleCritic",
     "VectorizedLinear",
     "Squeeze",
+    # Policy call utilities
+    "get_action",
+    "act_for_eval",
+    "sample_actions",
+    "sample_K_actions",
+    "sample_actions_with_log_prob",
 ]

@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 TensorBatch = List[torch.Tensor]
 
-from utils.policy_call import act_for_eval
+from algorithms.networks import act_for_eval
 
 from .utils_pytorch import (
     ActorConfig,
@@ -306,30 +306,37 @@ class ImplicitQLearning:
 
         return log_dict
 
-    def compute_actor_base_loss(
-        self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None
+    def compute_energy_function(
+        self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None, energy_type: str = "q"
     ) -> torch.Tensor:
-        """Actor1+용 base loss: Actor0와 동일한 advantage-weighted BC (POGO multi-actor에서 호출)"""
-        if actions is None:
-            raise ValueError("IQL compute_actor_base_loss requires actions")
-        with torch.no_grad():
-            target_q = self.q_target(state, actions)
-        v = self.vf(state)
-        adv = (target_q - v).detach()
-        exp_adv = torch.exp(self.beta * adv).clamp(max=EXP_ADV_MAX)
-
-        cfg = ActorConfig.from_actor(actor)
-        if hasattr(actor, "log_prob"):
-            lp = actor.log_prob(state, actions)
-            bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
-        elif hasattr(actor, "log_prob_actions"):
-            lp = actor.log_prob_actions(state, actions, keepdim=False)
-            bc_losses = -lp
+        """Energy function: -Q 또는 -A (POGO multi-actor Actor1+용)
+        
+        Args:
+            actor: Actor network
+            state: [B, state_dim]
+            actions: [B, action_dim] (energy_type="advantage"일 때 사용)
+            seed: Random seed
+            energy_type: "q" 또는 "advantage"
+        
+        Returns:
+            energy: [B] -> scalar (mean)
+        """
+        from algorithms.networks import get_action
+        
+        if energy_type == "advantage":
+            # -A: -advantage
+            if actions is None:
+                raise ValueError("IQL compute_energy_function with advantage requires actions")
+            with torch.no_grad():
+                target_q = self.q_target(state, actions)
+            v = self.vf(state)
+            adv = (target_q - v).detach()
+            return -adv.mean()
         else:
-            pi = action_for_loss(actor, cfg, state, seed=seed)
-            bc_losses = ((pi - actions) ** 2).sum(dim=1)
-
-        return (exp_adv * bc_losses).mean()
+            # -Q: -Q(state, pi(state))
+            pi_i, _ = get_action(actor, state, deterministic=False, need_log_prob=False)
+            q_value = self.q_target(state, pi_i)
+            return -q_value.mean()
 
     def state_dict(self) -> Dict[str, Any]:
         return {

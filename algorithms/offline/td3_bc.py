@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
-from utils.policy_call import act_for_eval, get_action
+from algorithms.networks import act_for_eval, get_action
 
 from .utils_pytorch import (
     ActorConfig,
@@ -213,15 +213,25 @@ class TD3_BC:
 
         return log_dict
 
-    def compute_actor_base_loss(
+    def compute_energy_function(
         self, actor: nn.Module, state: torch.Tensor, actions: Optional[torch.Tensor] = None, seed: Optional[int] = None
     ) -> torch.Tensor:
-        """Actor1+용 base loss: -λQ (POGO multi-actor에서 호출)"""
+        """Energy function: -Q (POGO multi-actor Actor1+용)
+        
+        Args:
+            actor: Actor network
+            state: [B, state_dim]
+            actions: Not used
+            seed: Random seed
+        
+        Returns:
+            energy: [B] -> scalar (mean)
+        """
+        from .utils_pytorch import ActorConfig, action_for_loss
         cfg = ActorConfig.from_actor(actor)
         pi = action_for_loss(actor, cfg, state, seed=seed)
         q = self.critic_1(state, pi)
-        lmbda = self.alpha / q.abs().mean().detach()
-        return -lmbda * q.mean()
+        return -q.mean()
 
     def state_dict(self) -> Dict[str, Any]:
         return {

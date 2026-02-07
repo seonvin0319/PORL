@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.distributions import Normal
-from utils.policy_call import act_for_eval, get_action
+from algorithms.networks import act_for_eval, get_action
 
 from .utils_pytorch import (
     ReplayBuffer,
