@@ -6,6 +6,7 @@
 import copy
 import os
 import random
+import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -626,7 +627,7 @@ def _create_config_file(config: TrainConfig) -> str:
 
 
 def wandb_init(config: TrainConfig) -> None:
-    """wandb 초기화 함수"""
+    """wandb 초기화. config use_wandb=true면 기본 활성화, mode='online' 고정."""
     if not config.use_wandb:
         return
     wandb.init(
@@ -635,7 +636,9 @@ def wandb_init(config: TrainConfig) -> None:
         group=config.group,
         name=config.name,
         id=str(uuid.uuid4()),
+        mode="online",
     )
+    print(f"[Wandb] 초기화 완료: project={config.project}, run={config.name}", flush=True)
 
 
 # 나머지 함수들 (compute_mean_std, normalize_states, wrap_env, modify_reward, ReplayBuffer, set_seed, eval_actor)은
@@ -656,9 +659,9 @@ def _parse_args_with_no_wandb():
     # 나머지 인자는 pyrallis가 처리하도록 전달
     args, remaining = parser.parse_known_args()
     
-    # --no_wandb가 설정되면 --use_wandb False로 변환
+    # --no_wandb가 설정되면 --use_wandb false로 변환 (config override)
     if args.no_wandb:
-        sys.argv = [sys.argv[0]] + ['--use_wandb', 'False'] + remaining
+        sys.argv = [sys.argv[0]] + ['--use_wandb', 'false'] + remaining
     else:
         sys.argv = [sys.argv[0]] + remaining
 
@@ -676,24 +679,26 @@ def train(config: TrainConfig):
         eval_actor as eval_actor_base,
     )
 
-    import sys
-    sys.stderr.write("=" * 60 + "\n")
-    sys.stderr.write("POGO Multi-Actor Training Started\n")
-    sys.stderr.write(f"Algorithm: {config.algorithm}\n")
-    sys.stderr.write(f"Environment: {config.env}\n")
-    sys.stderr.write("=" * 60 + "\n")
-    sys.stderr.flush()
-    
-    print(f"[DEBUG] Creating environment: {config.env}", flush=True)
+    print("=" * 60, flush=True)
+    print("POGO Multi-Actor Training Started", flush=True)
+    print(f"Algorithm: {config.algorithm}", flush=True)
+    print(f"Environment: {config.env}", flush=True)
+    print("=" * 60, flush=True)
+    print()
+
+    print(f"Creating environment: {config.env}...", flush=True)
     env = gym.make(config.env)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
-    print(f"[DEBUG] State dim: {state_dim}, Action dim: {action_dim}, Max action: {max_action}", flush=True)
+    print(f"State dimension: {state_dim}", flush=True)
+    print(f"Action dimension: {action_dim}", flush=True)
+    print(f"Max action: {max_action}", flush=True)
+    print()
 
-    print(f"[DEBUG] Loading dataset...", flush=True)
+    print(f"Loading D4RL dataset for {config.env}...", flush=True)
     dataset = d4rl.qlearning_dataset(env)
-    print(f"[DEBUG] Dataset loaded: {len(dataset['observations'])} transitions", flush=True)
+    print(f"Dataset size: {len(dataset['observations']):,}", flush=True)
     if config.normalize_reward:
         modify_reward(dataset, config.env)
 
@@ -701,6 +706,8 @@ def train(config: TrainConfig):
         state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
     else:
         state_mean, state_std = np.zeros(state_dim), np.ones(state_dim)
+    print(f"State normalization: mean shape={state_mean.shape}, std shape={state_std.shape}", flush=True)
+    print()
     dataset["observations"] = normalize_states(dataset["observations"], state_mean, state_std)
     dataset["next_observations"] = normalize_states(dataset["next_observations"], state_mean, state_std)
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
@@ -715,9 +722,11 @@ def train(config: TrainConfig):
 
     set_seed(config.seed, env)
 
-    # wandb 초기화
+    # wandb 초기화 (기본 활성화, --no_wandb 시 비활성화)
     if config.use_wandb:
         wandb_init(config)
+    else:
+        print("[Wandb] 비활성화됨 (--no_wandb)", flush=True)
 
     # Base trainer 생성 (각 알고리즘별)
     sinkhorn_loss = SamplesLoss(loss="sinkhorn", p=2, blur=config.sinkhorn_blur, backend=config.sinkhorn_backend)
@@ -1071,10 +1080,13 @@ def train(config: TrainConfig):
             save_checkpoint(t + 1, f"_step{t+1}")
 
         if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
+            print(f"[Training] Time steps: {t + 1}", flush=True)
+            actor_results = []
             for i in range(config.num_actors):
                 # 평가는 각 actor마다
+                # deterministic policy → deterministic eval, stochastic policy → stochastic eval
                 actor_i = actors[i]
+                use_deterministic_eval = not actor_is_stochastic[i]
                 try:
                     env.seed(config.seed + 100 + i)
                     env.action_space.seed(config.seed + 100 + i)
@@ -1088,7 +1100,10 @@ def train(config: TrainConfig):
                         state = state[0]
                     ep_ret = 0.0
                     while not done:
-                        action = act_for_eval(actor_i, state, config.device)
+                        action = act_for_eval(
+                            actor_i, state, config.device,
+                            deterministic=use_deterministic_eval,
+                        )
                         step_out = env.step(action)
                         if len(step_out) == 5:
                             state, reward, terminated, truncated, _ = step_out
@@ -1100,10 +1115,11 @@ def train(config: TrainConfig):
                 actor_i.train()
                 scores = np.asarray(episode_rewards)
                 norm_score = env.get_normalized_score(scores.mean()) * 100.0
+                raw_avg = float(scores.mean())
                 evaluations[i].append(norm_score)
                 log_dict[f"eval_actor_{i}"] = norm_score
-                print(f"  Actor {i} eval (norm): {norm_score:.1f}", flush=True)
-                
+                actor_results.append({"raw_avg": raw_avg, "norm_score": norm_score})
+
                 # 평가 결과를 로그에 추가
                 eval_log = {
                     "timestep": t + 1,
@@ -1113,7 +1129,7 @@ def train(config: TrainConfig):
                     "std": float(scores.std()),
                 }
                 all_logs.append(eval_log)
-                
+
                 # wandb에 평가 결과 로깅
                 if config.use_wandb:
                     wandb.log({
@@ -1121,6 +1137,13 @@ def train(config: TrainConfig):
                         f"eval/actor_{i}/raw_score": float(scores.mean()),
                         f"eval/actor_{i}/std": float(scores.std()),
                     }, step=t + 1)
+
+            print("---------------------------------------", flush=True)
+            print(f"Evaluation over {config.n_episodes} episodes:", flush=True)
+            for i in range(config.num_actors):
+                r = actor_results[i]
+                print(f"  Actor {i} - Raw: {r['raw_avg']:.3f}, D4RL score: {r['norm_score']:.1f}", flush=True)
+            print("---------------------------------------", flush=True)
 
     # 학습 완료 후 final eval 전에 체크포인트 저장
     print("\n" + "=" * 60, flush=True)
@@ -1130,13 +1153,13 @@ def train(config: TrainConfig):
     
     # 학습 완료 후 최종 평가
     print("\n" + "=" * 60, flush=True)
-    print("Final evaluation...", flush=True)
+    print("======== Final Evaluation (trained weights) ========", flush=True)
     print("=" * 60, flush=True)
     for i in range(config.num_actors):
         if evaluations[i]:
             final_score = evaluations[i][-1]
             best_score = max(evaluations[i])
-            print(f"Actor {i}: Final={final_score:.1f}, Best={best_score:.1f}", flush=True)
+            print(f"[FINAL] Actor {i}: Final={final_score:.1f}, Best={best_score:.1f}", flush=True)
     
     # 로그 저장: results/{algorithm}/{env}/{task}/seed_{seed}/logs/
     import json

@@ -165,6 +165,17 @@ results/**/*.npz
 logs/
 *_all_envs_*.log
 *_training_*.log
+*.out
+
+# Run scripts (README 문서화된 것만 커밋: env_common.sh, run_iql_awac_*.sh)
+run_iql_pogo_seed0.sh
+run_iql_pogo_seed0_parallel.sh
+run_awac_pogo_seed0.sh
+run_cql_pogo_seed0.sh
+run_sac_n_pogo_seed0.sh
+run_single_rebrac.sh
+run_iql_all_envs.sh
+run_rebrac_all_envs.sh
 
 # Data files (일반적으로 무시, 필요시 예외 처리)
 *.csv

@@ -158,13 +158,16 @@ def act_for_eval(
     *,
     action_dim: Optional[int] = None,
     max_action: Optional[float] = None,
+    deterministic: bool = True,
 ):
-    """평가/롤아웃용: actor.act(state, device) 대체."""
+    """평가/롤아웃용: actor.act(state, device) 대체.
+    deterministic: True면 mean/고정값, False면 policy에서 샘플링 (stochastic eval).
+    """
     import numpy as np
 
     policy = _ensure_policy(policy, action_dim, max_action)
     if hasattr(policy, "act"):
         return policy.act(state, device)
     state_t = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-    action, _ = get_action(policy, state_t, deterministic=True)
+    action, _ = get_action(policy, state_t, deterministic=deterministic)
     return action.cpu().numpy().flatten()
