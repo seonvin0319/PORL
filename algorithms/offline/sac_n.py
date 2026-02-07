@@ -8,6 +8,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
+from algorithms.networks import TanhGaussianMLP
 
 import d4rl
 import gym
@@ -69,9 +70,6 @@ class TrainConfig:
 # general utils
 TensorBatch = List[torch.Tensor]
 
-
-
-
 # SAC Actor & Critic implementation
 class VectorizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, ensemble_size: int):
@@ -99,9 +97,6 @@ class VectorizedLinear(nn.Module):
         # weight: [ensemble_size, input_size, out_size]
         # out: [ensemble_size, batch_size, out_size]
         return x @ self.weight + self.bias
-
-
-from algorithms.networks import TanhGaussianMLP
 
 
 def Actor(state_dim: int, action_dim: int, hidden_dim: int, max_action: float = 1.0):

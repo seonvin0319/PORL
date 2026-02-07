@@ -1,5 +1,5 @@
 algorithm: sac_n
-env: halfcheetah-medium-v2
+env: walker2d-medium-replay-v2
 seed: 0
 eval_freq: 5000
 n_episodes: 10
@@ -22,5 +22,5 @@ normalize: true
 normalize_reward: false
 use_wandb: true
 project: PORL
-group: pogo-multi-sac-n-halfcheetah
-name: pogo-multi-sac-n-halfcheetah-medium-v2
+group: pogo-multi-sac-n-walker2d
+name: pogo-multi-sac-n-walker2d-medium-replay-v2

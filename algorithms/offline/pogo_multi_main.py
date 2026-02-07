@@ -687,8 +687,17 @@ def train(config: TrainConfig):
     print("=" * 60, flush=True)
     print()
 
+    # Seed 설정 (모든 랜덤 소스 초기화)
+    # 환경 생성 전에 seed 설정하여 완전한 재현성 보장
+    set_seed(config.seed, deterministic_torch=False)
+    print(f"Seed set to: {config.seed} (for reproducibility)", flush=True)
+    print()
+
     print(f"Creating environment: {config.env}...", flush=True)
     env = gym.make(config.env)
+    # 환경 seed 설정 (gym.make 이후)
+    set_seed(config.seed, env=env, deterministic_torch=False)
+    
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -698,6 +707,7 @@ def train(config: TrainConfig):
     print()
 
     print(f"Loading D4RL dataset for {config.env}...", flush=True)
+    # D4RL dataset 로딩 (seed가 설정된 상태에서 로딩)
     dataset = d4rl.qlearning_dataset(env)
     print(f"Dataset size: {len(dataset['observations']):,}", flush=True)
     if config.normalize_reward:
@@ -713,7 +723,8 @@ def train(config: TrainConfig):
     dataset["next_observations"] = normalize_states(dataset["next_observations"], state_mean, state_std)
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
 
-    replay_buffer = ReplayBuffer(state_dim, action_dim, config.buffer_size, config.device)
+    # ReplayBuffer에 seed 전달하여 재현성 보장
+    replay_buffer = ReplayBuffer(state_dim, action_dim, config.buffer_size, config.device, seed=config.seed)
     replay_buffer.load_d4rl_dataset(dataset)
 
     if config.checkpoints_path:
@@ -721,7 +732,8 @@ def train(config: TrainConfig):
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
-    set_seed(config.seed, env)
+    # Seed는 이미 위에서 설정했으므로 중복 호출 제거
+    # set_seed는 환경 생성 전과 후에 이미 호출됨
 
     # wandb 초기화 (기본 활성화, --no_wandb 시 비활성화)
     if config.use_wandb:
@@ -1089,14 +1101,30 @@ def train(config: TrainConfig):
                 # deterministic policy → deterministic eval, stochastic policy → stochastic eval
                 actor_i = actors[i]
                 use_deterministic_eval = not actor_is_stochastic[i]
+                
+                # 평가용 seed 설정 (actor별, episode별로 일관된 seed 사용)
+                eval_seed_base = config.seed + 10000 + i * 1000
+                
+                # 환경 seed 설정 (재현성 보장)
                 try:
-                    env.seed(config.seed + 100 + i)
-                    env.action_space.seed(config.seed + 100 + i)
+                    env.seed(eval_seed_base)
+                    env.action_space.seed(eval_seed_base)
+                    if hasattr(env, 'observation_space'):
+                        env.observation_space.seed(eval_seed_base)
                 except Exception:
                     pass
+                
                 actor_i.eval()
                 episode_rewards = []
                 for ep in range(config.n_episodes):
+                    # 각 episode마다 다른 seed 사용 (하지만 일관성 유지)
+                    episode_seed = eval_seed_base + ep
+                    try:
+                        env.seed(episode_seed)
+                        env.action_space.seed(episode_seed)
+                    except Exception:
+                        pass
+                    
                     state, done = env.reset(), False
                     if isinstance(state, tuple):
                         state = state[0]

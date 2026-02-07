@@ -1,5 +1,5 @@
-algorithm: sac_n
-env: halfcheetah-medium-v2
+algorithm: edac
+env: antmaze-umaze-v2
 seed: 0
 eval_freq: 5000
 n_episodes: 10
@@ -12,6 +12,7 @@ sinkhorn_K: 4
 sinkhorn_blur: 0.05
 sinkhorn_backend: tensorized
 num_critics: 10
+eta: 1.0
 alpha_learning_rate: 3e-4
 actor_lr: 3e-4
 batch_size: 256
@@ -22,5 +23,5 @@ normalize: true
 normalize_reward: false
 use_wandb: true
 project: PORL
-group: pogo-multi-sac-n-halfcheetah
-name: pogo-multi-sac-n-halfcheetah-medium-v2
+group: pogo-multi-edac-antmaze
+name: pogo-multi-edac-antmaze-umaze-v2

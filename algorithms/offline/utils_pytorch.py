@@ -143,6 +143,7 @@ class ReplayBuffer:
         action_dim: int,
         buffer_size: int,
         device: str = "cpu",
+        seed: Optional[int] = None,
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
@@ -160,6 +161,10 @@ class ReplayBuffer:
         )
         self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
         self._device = device
+        
+        # NumPy Generator for reproducible sampling
+        # 전역 numpy random state 대신 독립적인 generator 사용
+        self._rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
 
     def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.float32, device=self._device)
@@ -184,8 +189,12 @@ class ReplayBuffer:
         print(f"Dataset size: {n_transitions}")
 
     def sample(self, batch_size: int) -> List[torch.Tensor]:
-        """Sample a batch of transitions"""
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
+        """Sample a batch of transitions
+        
+        재현성을 위해 내부 numpy Generator 사용 (전역 numpy random state와 독립적)
+        """
+        max_idx = min(self._size, self._pointer)
+        indices = self._rng.integers(0, max_idx, size=batch_size)
         states = self._states[indices]
         actions = self._actions[indices]
         rewards = self._rewards[indices]
@@ -211,17 +220,55 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
 def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
-    """Set random seeds for reproducibility"""
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
+    """Set random seeds for reproducibility
+    
+    모든 랜덤 소스에 seed를 설정하여 완전한 재현성 보장:
+    - Python random
+    - NumPy random
+    - PyTorch random (CPU & CUDA)
+    - 환경 (gym) seed
+    - Python hash seed
+    """
     import os
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
     import random
+    
+    # Python hash seed (dict 등에서 사용)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    
+    # Python random
     random.seed(seed)
+    
+    # NumPy random
+    np.random.seed(seed)
+    
+    # PyTorch random (CPU)
     torch.manual_seed(seed)
+    
+    # PyTorch random (CUDA) - 모든 GPU에 적용
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # CUDA 연산의 재현성 보장 (성능 저하 가능)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    # PyTorch deterministic algorithms
     torch.use_deterministic_algorithms(deterministic_torch)
+    
+    # 환경 seed 설정
+    if env is not None:
+        try:
+            env.seed(seed)
+        except AttributeError:
+            pass
+        try:
+            env.action_space.seed(seed)
+        except AttributeError:
+            pass
+        try:
+            env.observation_space.seed(seed)
+        except AttributeError:
+            pass
 
 
 def wandb_init(config: dict) -> None:
@@ -240,16 +287,42 @@ def wandb_init(config: dict) -> None:
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    """Evaluate actor on environment"""
-    env.seed(seed)
+    """Evaluate actor on environment
+    
+    재현성을 위해 각 episode마다 일관된 seed 사용
+    """
     actor.eval()
+    # 환경 seed 설정 (재현성 보장)
+    try:
+        env.seed(seed)
+        env.action_space.seed(seed)
+        if hasattr(env, 'observation_space'):
+            env.observation_space.seed(seed)
+    except Exception:
+        pass
+    
     episode_rewards = []
-    for _ in range(n_episodes):
+    for ep in range(n_episodes):
+        # 각 episode마다 다른 seed 사용 (하지만 일관성 유지)
+        episode_seed = seed + ep
+        try:
+            env.seed(episode_seed)
+            env.action_space.seed(episode_seed)
+        except Exception:
+            pass
+        
         state, done = env.reset(), False
+        if isinstance(state, tuple):
+            state = state[0]
         episode_reward = 0.0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                state, reward, terminated, truncated, _ = step_out
+                done = terminated or truncated
+            else:
+                state, reward, done, _ = step_out
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
