@@ -51,7 +51,7 @@ Policy 타입에 따라 자동 선택:
 | Both Stochastic (not Gaussian) | Sinkhorn (GeomLoss) |
 | At least one Deterministic | L2 |
 
-### Policy 타입 (`networks.py`)
+### Policy 타입 (`algorithms/networks/`)
 
 | 타입 | W2 | 속성 |
 |------|-----|------|
@@ -59,6 +59,8 @@ Policy 타입에 따라 자동 선택:
 | TanhGaussianMLP | Sinkhorn | `is_gaussian=False`, `is_stochastic=True` |
 | StochasticMLP | Sinkhorn | `is_gaussian=False`, `is_stochastic=True` |
 | DeterministicMLP | L2 | `is_gaussian=False`, `is_stochastic=False` |
+
+**참고**: 모든 Actor는 `ActorAPI(Protocol)` 인터페이스를 구현하며, `deterministic_actions`, `sample_actions`, `log_prob_actions` 메서드를 제공합니다.
 
 ### 알고리즘별 Actor Loss (기존)
 
@@ -107,18 +109,24 @@ Policy 타입에 따라 자동 선택:
 ## 코드 구조
 
 ```
-algorithms/offline/
-├── pogo_multi_main.py      # 통합 학습 진입점
-│   ├── _create_actors()           # Actor0 + Actor1+ 생성
-│   ├── _compute_w2_distance()     # W2 거리 (Gaussian/Sinkhorn/L2)
-│   ├── _compute_actor_loss_with_w2()
-│   ├── _train_multi_actor()       # trainer.train + Actor1+ 업데이트
-│   └── train()                    # 메인 루프
-├── networks.py             # GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP
-├── utils_pytorch.py        # ActorConfig, action_for_loss
-├── iql.py, awac.py, td3_bc.py, cql.py, sac_n.py, edac.py   # 각 알고리즘 (수정 없음)
-│   └── compute_actor_base_loss()  # Actor1+용 base loss (알고리즘별 구현)
-├── pogo_multi_jax.py       # JAX 버전 (ReBRAC)
+algorithms/
+├── networks/               # 통합 네트워크 패키지
+│   ├── __init__.py        # 모든 클래스 re-export
+│   ├── actors.py          # BaseActor, GaussianMLP, TanhGaussianMLP, DeterministicMLP 등
+│   ├── critics.py         # FullyConnectedQFunction, EnsembleCritic, VectorizedLinear 등
+│   ├── mlp.py             # build_mlp, init_module_weights, create_generator 등
+│   └── adapters.py        # ActorAPI(Protocol), PolicyAdapter
+├── offline/
+│   ├── pogo_multi_main.py      # 통합 학습 진입점
+│   │   ├── _create_actors()           # Actor0 + Actor1+ 생성
+│   │   ├── _compute_w2_distance()     # W2 거리 (Gaussian/Sinkhorn/L2)
+│   │   ├── _compute_actor_loss_with_w2()
+│   │   ├── _train_multi_actor()       # trainer.train + Actor1+ 업데이트
+│   │   └── train()                    # 메인 루프
+│   ├── utils_pytorch.py        # 공통 유틸리티 (soft_update, ReplayBuffer, eval_actor 등)
+│   ├── iql.py, awac.py, td3_bc.py, cql.py, sac_n.py, edac.py   # 각 알고리즘
+│   │   └── compute_actor_base_loss()  # Actor1+용 base loss (알고리즘별 구현)
+│   └── pogo_multi_jax.py       # JAX 버전 (ReBRAC)
 └── utils/policy_call.py    # get_action, act_for_eval, sample_K_actions
 ```
 
@@ -127,14 +135,17 @@ algorithms/offline/
 | 파일 | 역할 |
 |------|------|
 | `pogo_multi_main.py` | 알고리즘 선택, Actor 생성, `_train_multi_actor`로 통합 학습 |
-| `networks.py` | POGO policy 클래스 (GaussianMLP 등) |
-| `utils_pytorch.py` | `ActorConfig`, `action_for_loss` (미분 가능 action, W2용) |
+| `algorithms/networks/` | 통합 네트워크 패키지 (Actor, Critic, MLP 유틸리티) |
+| `algorithms/networks/actors.py` | 모든 Actor 클래스 (GaussianMLP, TanhGaussianMLP 등) |
+| `algorithms/networks/adapters.py` | `ActorAPI(Protocol)` 인터페이스 정의 |
+| `utils_pytorch.py` | 공통 유틸리티 (soft_update, ReplayBuffer, eval_actor, normalize_states 등) |
 | `policy_call.py` | 평가/학습 시 policy 호출 통일 |
 
 ### Actor 생성 (`_create_actors`)
 
-- **Actor0**: `actor_creation.create_actor0()` — 알고리즘별 (예: IQL → GaussianPolicy, TD3_BC → DeterministicMLP)
-- **Actor1+**: `networks.py`의 POGO policies. `actor_configs` 미지정 시 Actor0 구조 추론 후 동일 타입 사용, `state_dict` 복사로 초기화
+- **Actor0**: `actor_creation.create_actor0()` — 알고리즘별 (예: IQL → GaussianMLP, TD3_BC → DeterministicMLP)
+- **Actor1+**: `algorithms.networks`의 POGO policies. `actor_configs` 미지정 시 Actor0 구조 추론 후 동일 타입 사용, `state_dict` 복사로 초기화
+- **인터페이스**: 모든 Actor는 `ActorAPI(Protocol)`을 구현하여 `deterministic_actions`, `sample_actions`, `log_prob_actions` 메서드를 제공
 
 ---
 
@@ -165,6 +176,20 @@ W2/Loss 계산 시 **미분 가능한** action 필요. `deterministic_actions()`
 ### 5. 기존 알고리즘 파일
 
 `iql.py`, `awac.py` 등은 **수정하지 않음**. `compute_actor_base_loss`만 POGO용으로 추가. `train()`/`update()` 내부 로직은 그대로 사용.
+
+### 6. 코드 리팩토링 (2024)
+
+- **네트워크 통합**: `algorithms/offline/networks.py` → `algorithms/networks/` 패키지로 분리
+  - `actors.py`: 모든 Actor 클래스
+  - `critics.py`: 모든 Critic 클래스
+  - `mlp.py`: MLP 빌딩 및 초기화 유틸리티
+  - `adapters.py`: `ActorAPI(Protocol)` 인터페이스
+- **유틸리티 통합**: 중복 함수들을 `algorithms/offline/utils_pytorch.py`로 통합
+  - `soft_update`, `ReplayBuffer`, `eval_actor`, `normalize_states`, `set_seed`, `wandb_init` 등
+- **인터페이스 명확화**: `ActorAPI(Protocol)`로 모든 Actor의 공통 인터페이스 정의
+  - `deterministic_actions(states) -> [B, A]`
+  - `sample_actions(states, K=1, seed=None) -> [B, K, A]`
+  - `log_prob_actions(states, actions) -> [B]`
 
 ---
 
