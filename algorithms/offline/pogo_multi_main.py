@@ -192,16 +192,20 @@ class TrainConfig:
     normalize_reward: bool = False
 
     # Wandb
-    entity: str = "seonvin0319"
-    project: str = "PORL"
-    group: str = "POGO-Multi"
-    name: str = "POGO-Multi"
+    wandb_project: str = "PORL"
+    wandb_entity: Optional[str] = "seonvin0319"
+    wandb_name: Optional[str] = None
     use_wandb: bool = True
+    group: str = "POGO-Multi"  # 하위 호환성 유지
     
     # Logging / checkpoint
-    log_interval: int = 1  # train log 주기 (env-step 기준)
+    log_interval: int = 1  # train log 주기 (step 기준)
     checkpoint_freq: int = int(5e5)  # 500k
     save_train_logs: bool = True
+    
+    # Final evaluation
+    final_eval_runs: int = 5
+    final_eval_episodes: int = 10
 
     def __post_init__(self):
         if self.num_actors is None:
@@ -227,9 +231,11 @@ class TrainConfig:
                 w2_str = "_".join([str(int(w)) if w == int(w) else str(w) for w in self.w2_weights])
         else:
             w2_str = "10"
-        self.name = f"{self.env}-{self.algorithm}-seed{self.seed}-w{w2_str}"
+        default_name = f"{self.env}-{self.algorithm}-seed{self.seed}-w{w2_str}"
+        if self.wandb_name is None:
+            self.wandb_name = default_name
         if self.checkpoints_path is not None:
-            self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
+            self.checkpoints_path = os.path.join(self.checkpoints_path, default_name)
 
 
 def _per_state_sinkhorn(
@@ -240,13 +246,25 @@ def _per_state_sinkhorn(
     blur: float = 0.05,
     sinkhorn_loss=None,
     seed: Optional[int] = None,
+    backend: str = "tensorized",
 ):
+    """
+    Per-state Sinkhorn distance 계산
+    
+    주의: SamplesLoss 출력이 상황별로 scalar/tensor일 수 있으므로
+    loss.dim() > 0 체크로 안전하게 처리합니다.
+    per-state 기대를 정확히 원하면 sample_actions의 반환 shape가
+    "point cloud" semantics를 따르는지 확인해야 합니다:
+    - sample_actions는 [B, K, action_dim] 형태를 반환해야 합니다.
+    - sinkhorn_loss는 [B, K] point cloud 간 거리를 계산합니다.
+    """
     if sinkhorn_loss is None:
-        sinkhorn_loss = SamplesLoss(loss="sinkhorn", p=2, blur=blur, backend="tensorized")
+        sinkhorn_loss = SamplesLoss(loss="sinkhorn", p=2, blur=blur, backend=backend)
     a = policy.sample_actions(states, K=K, seed=None if seed is None else seed + 0)
     with torch.no_grad():
         b_detached = ref.sample_actions(states, K=K, seed=None if seed is None else seed + 10000).detach()
     loss = sinkhorn_loss(a, b_detached)
+    # SamplesLoss 출력이 상황별로 scalar/tensor일 수 있으므로 안전하게 처리
     return loss.mean() if loss.dim() > 0 else loss
 
 
@@ -320,6 +338,7 @@ def _compute_w2_distance(
     sinkhorn_blur: float = 0.05,
     sinkhorn_loss=None,
     seed: Optional[int] = None,
+    backend: str = "tensorized",
 ) -> torch.Tensor:
     """
     공통 W2 distance 계산 함수 (JAX 버전과 일관성 유지)
@@ -355,6 +374,7 @@ def _compute_w2_distance(
             K=sinkhorn_K, blur=sinkhorn_blur,
             sinkhorn_loss=sinkhorn_loss,
             seed=seed,
+            backend=backend,
         )
     else:
         # At least one deterministic: use L2
@@ -374,6 +394,7 @@ def _compute_actor_loss_with_w2(
     sinkhorn_blur: float = 0.05,
     sinkhorn_loss=None,
     seed: Optional[int] = None,
+    backend: str = "tensorized",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     공통 multi-actor loss 계산 함수 (JAX 버전과 일관성 유지)
@@ -410,6 +431,7 @@ def _compute_actor_loss_with_w2(
         sinkhorn_blur=sinkhorn_blur,
         sinkhorn_loss=sinkhorn_loss,
         seed=seed,
+        backend=backend,
     )
     
     return base_loss + w2_weight * w2_distance, w2_distance
@@ -439,6 +461,7 @@ def _update_single_actor_pytorch(
     sinkhorn_loss,
     seed_base: int,
     tau: float,
+    backend: str = "tensorized",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     단일 actor 업데이트 헬퍼 함수 (JAX 버전의 _update_single_actor와 유사)
@@ -489,6 +512,7 @@ def _update_single_actor_pytorch(
             sinkhorn_blur=sinkhorn_blur,
             sinkhorn_loss=sinkhorn_loss,
             seed=seed_base + 100 + actor_idx,
+            backend=backend,
         )
         actor_loss = base_loss + w2_weight * w2_distance
     
@@ -593,6 +617,7 @@ def update_multi_actor_pytorch(
             sinkhorn_loss=sinkhorn_loss,
             seed_base=seed_base,
             tau=tau,
+            backend=sinkhorn_backend,
         )
         
         log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
@@ -608,6 +633,152 @@ def update_multi_actor_pytorch(
     )
     
     return log_dict
+
+
+# ============================================================================
+# 평가 및 로깅 유틸리티
+# ============================================================================
+
+def eval_policy_multi(
+    actor: nn.Module,
+    env: gym.Env,
+    base_seed: int,
+    n_episodes: int = 10,
+    device: str = "cuda",
+    state_mean: Optional[np.ndarray] = None,
+    state_std: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float, float]:
+    """
+    Multi-actor 정책 평가: deterministic과 stochastic 모두 평가하고 결과 반환
+    
+    Args:
+        actor: 평가할 actor network
+        env: 평가 환경
+        base_seed: 기본 시드 (pogogo.py 스타일: config.seed + 100 + i * 100)
+        n_episodes: 평가 episode 수
+        device: 디바이스
+        state_mean: 상태 정규화 평균 (None이면 정규화 안 함)
+        state_std: 상태 정규화 표준편차 (None이면 정규화 안 함)
+    
+    Returns:
+        tuple: (det_avg, det_score, stoch_avg, stoch_score)
+            - det_avg: deterministic 평균 리워드
+            - det_score: deterministic D4RL 정규화 점수
+            - stoch_avg: stochastic 평균 리워드
+            - stoch_score: stochastic D4RL 정규화 점수
+    """
+    actor.eval()
+    
+    # Deterministic 평가
+    det_total = 0.0
+    for ep in range(n_episodes):
+        ep_seed = base_seed + ep
+        np.random.seed(ep_seed)
+        try:
+            env.action_space.seed(ep_seed)
+            reset_result = env.reset(seed=ep_seed)
+        except (TypeError, AttributeError):
+            try:
+                reset_result = env.reset(seed=ep_seed)
+            except TypeError:
+                if hasattr(env, 'seed'):
+                    env.seed(ep_seed)
+                reset_result = env.reset()
+        
+        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+        done = False
+        ep_ret = 0.0
+        while not done:
+            # 상태 정규화
+            if state_mean is not None and state_std is not None:
+                nstate = (np.asarray(state).reshape(1, -1) - state_mean) / state_std
+            else:
+                nstate = np.asarray(state).reshape(1, -1)
+            
+            action = actor.act(nstate, device)
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                state, reward, terminated, truncated, _ = step_out
+                done = terminated or truncated
+            else:
+                state, reward, done, _ = step_out
+            ep_ret += reward
+        det_total += ep_ret
+    
+    # Stochastic 평가 (재현성을 위해 시드 고정)
+    stoch_total = 0.0
+    step_count = 0
+    for ep in range(n_episodes):
+        ep_seed = base_seed + ep
+        np.random.seed(ep_seed)
+        try:
+            env.action_space.seed(ep_seed)
+            reset_result = env.reset(seed=ep_seed)
+        except (TypeError, AttributeError):
+            try:
+                reset_result = env.reset(seed=ep_seed)
+            except TypeError:
+                if hasattr(env, 'seed'):
+                    env.seed(ep_seed)
+                reset_result = env.reset()
+        
+        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+        done = False
+        ep_ret = 0.0
+        while not done:
+            # 상태 정규화
+            if state_mean is not None and state_std is not None:
+                nstate = (np.asarray(state).reshape(1, -1) - state_mean) / state_std
+            else:
+                nstate = np.asarray(state).reshape(1, -1)
+            
+            state_tensor = torch.tensor(nstate, device=device, dtype=torch.float32)
+            # 재현성을 위해 episode와 step 기반 시드 사용 (pogogo.py 스타일)
+            eval_seed = base_seed * 10000 + ep * 1000 + step_count
+            actions = actor.sample_actions(state_tensor, K=1, seed=eval_seed)
+            action = actions[0].cpu().numpy().flatten()
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                state, reward, terminated, truncated, _ = step_out
+                done = terminated or truncated
+            else:
+                state, reward, done, _ = step_out
+            ep_ret += reward
+            step_count += 1
+        stoch_total += ep_ret
+    
+    actor.train()
+    
+    # 결과 계산
+    det_avg = det_total / n_episodes
+    stoch_avg = stoch_total / n_episodes
+    det_score = env.get_normalized_score(det_avg) * 100.0
+    stoch_score = env.get_normalized_score(stoch_avg) * 100.0
+    
+    return det_avg, det_score, stoch_avg, stoch_score
+
+
+def log_train_wandb(train_out: dict, step: int):
+    """학습 메트릭 wandb 로깅 (pogogo.py 스타일)"""
+    log_dict = {}
+    for k, v in train_out.items():
+        if k == "timestep":
+            continue
+        if isinstance(v, (int, float, np.floating)):
+            log_dict[f"train/{k}"] = float(v)
+    log_dict["train/global_step"] = int(step)
+    wandb.log(log_dict, step=int(step))
+
+
+def log_eval_wandb(actor_results: list, step: int):
+    """평가 메트릭 wandb 로깅 (pogogo.py 스타일)"""
+    eval_log_dict = {"eval/global_step": int(step)}
+    for i, r in enumerate(actor_results):
+        eval_log_dict[f"eval/actor_{i}/det_score"] = float(r["det_score"])
+        eval_log_dict[f"eval/actor_{i}/det_avg"] = float(r["det_avg"])
+        eval_log_dict[f"eval/actor_{i}/stoch_score"] = float(r["stoch_score"])
+        eval_log_dict[f"eval/actor_{i}/stoch_avg"] = float(r["stoch_avg"])
+    wandb.log(eval_log_dict, step=int(step))
 
 
 # 나머지 함수들 (compute_mean_std, normalize_states, wrap_env, modify_reward, ReplayBuffer, set_seed, wandb_init, eval_actor)은
@@ -853,8 +1024,8 @@ def train(config: TrainConfig):
         from .awac import Critic as AWACCritic
         critic_1 = AWACCritic(state_dim, action_dim, hidden_dim=256).to(config.device)
         critic_2 = AWACCritic(state_dim, action_dim, hidden_dim=256).to(config.device)
-        critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=config.actor_lr)
-        critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=config.actor_lr)
+        critic_1_optimizer = torch.optim.Adam(critic_1.parameters(), lr=config.qf_lr)
+        critic_2_optimizer = torch.optim.Adam(critic_2.parameters(), lr=config.qf_lr)
 
         trainer = AdvantageWeightedActorCritic(
             actor=actors[0],
@@ -897,7 +1068,7 @@ def train(config: TrainConfig):
     elif config.algorithm == "sac_n":
         # SAC-N: VectorizedCritic 사용 (여러 critic ensemble)
         critic = VectorizedCritic(state_dim, action_dim, getattr(config, "hidden_dim", 256), config.num_critics).to(config.device)
-        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.actor_lr)
+        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.qf_lr)
 
         trainer = SACN(
             actor=actors[0],  # 첫 번째 actor를 base trainer에 연결
@@ -938,7 +1109,7 @@ def train(config: TrainConfig):
     elif config.algorithm == "edac":
         # EDAC: VectorizedCritic 사용 + diversity loss
         critic = VectorizedCritic(state_dim, action_dim, getattr(config, "hidden_dim", 256), config.num_critics).to(config.device)
-        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.actor_lr)
+        critic_optimizer = torch.optim.Adam(critic.parameters(), lr=config.qf_lr)
 
         trainer = EDAC(
             actor=actors[0],  # 첫 번째 actor를 base trainer에 연결
@@ -988,10 +1159,6 @@ def train(config: TrainConfig):
 
     evaluations = {i: [] for i in range(config.num_actors)}
     
-    # 전역 카운터
-    global_env_step = 0  # env timestep
-    global_update_step = 0  # gradient update count
-    
     train_logs = []
     eval_logs = []
     last_eval_step = 0
@@ -1001,33 +1168,28 @@ def train(config: TrainConfig):
     if config.use_wandb:
         wandb.init(
             config=asdict(config),
-            entity=config.entity,
-            project=config.project,
+            entity=config.wandb_entity,
+            project=config.wandb_project,
             group=config.group,
-            name=config.name,
+            name=config.wandb_name,
             id=str(uuid.uuid4()),
         )
     
+    global_step = 0  # 마지막 step 저장용
     for t in range(int(config.max_timesteps)):
-        global_env_step += config.batch_size
-        global_update_step += 1
+        global_step = t + 1
         
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         train_out = train_fn(batch)
         
         # wandb 로깅: 학습 메트릭 (pogogo.py 형식)
-        if config.use_wandb and (global_env_step % config.log_interval == 0):
-            log_dict = {f"train/{k}": float(v) if isinstance(v, (int, float, np.floating)) else v 
-                       for k, v in train_out.items() 
-                       if k != "timestep"}
-            log_dict["train/global_step"] = global_env_step
-            wandb.log(log_dict, step=global_env_step)
+        if config.use_wandb:
+            log_train_wandb(train_out, global_step)
         
         # 공통 메타 필드 부착 (파일 저장용)
         train_log = {
-            "env_step": int(global_env_step),
-            "update_step": int(global_update_step),
+            "update_step": int(global_step),
             "epoch": None,  # 필요하면 채우기
             **{k: float(v) if isinstance(v, (int, float, np.floating)) else v 
                for k, v in train_out.items() 
@@ -1038,11 +1200,11 @@ def train(config: TrainConfig):
         train_log.pop("timestep", None)
         
         # train 로그 저장/출력
-        if config.save_train_logs and (global_env_step % config.log_interval == 0):
+        if config.save_train_logs and (global_step % config.log_interval == 0):
             train_logs.append(train_log)
         
         # 체크포인트
-        if global_env_step % config.checkpoint_freq == 0:
+        if global_step % config.checkpoint_freq == 0:
             checkpoint_dir = os.path.join("results", config.algorithm, config.env.replace("-", "_"), f"seed_{config.seed}", "checkpoints")
             os.makedirs(checkpoint_dir, exist_ok=True)
             ckpt = {}
@@ -1058,104 +1220,29 @@ def train(config: TrainConfig):
                 ckpt[f"actor_{i}"] = actors[i].state_dict()
                 if actor_targets[i] is not None:
                     ckpt[f"actor_{i}_target"] = actor_targets[i].state_dict()
-            checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_env_step}.pt")
+            checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_step}.pt")
             torch.save(ckpt, checkpoint_file)
         
-        # 진행 상황 출력 (10k timestep마다)
-        if global_env_step % 10000 == 0 or global_env_step >= config.max_timesteps:
-            print(f"Env steps: {global_env_step}", flush=True)
+        # 진행 상황 출력 (10k step마다)
+        if global_step % 10000 == 0 or global_step >= config.max_timesteps:
+            print(f"Steps: {global_step}", flush=True)
 
         # 평가
-        if (global_env_step - last_eval_step) >= config.eval_freq or global_env_step >= config.max_timesteps:
-            print(f"  Evaluation at step {global_env_step}:", flush=True)
+        if global_step % config.eval_freq == 0:
+            print(f"  Evaluation at step {global_step}:", flush=True)
             actor_results = []
             for i in range(config.num_actors):
-                actor_i = actors[i]
-                try:
-                    env.seed(config.seed + 100 + i)
-                    env.action_space.seed(config.seed + 100 + i)
-                except Exception:
-                    pass
-                actor_i.eval()
-                
-                # Deterministic 평가
-                episode_rewards_det = []
-                for ep in range(config.n_episodes):
-                    ep_seed = config.seed + 100 + i * 100 + ep
-                    np.random.seed(ep_seed)
-                    try:
-                        env.action_space.seed(ep_seed)
-                        reset_result = env.reset(seed=ep_seed)
-                    except (TypeError, AttributeError):
-                        try:
-                            reset_result = env.reset(seed=ep_seed)
-                        except TypeError:
-                            if hasattr(env, 'seed'):
-                                env.seed(ep_seed)
-                            reset_result = env.reset()
-                    
-                    state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-                    done = False
-                    ep_ret = 0.0
-                    while not done:
-                        action = actor_i.act(state, config.device)
-                        step_out = env.step(action)
-                        if len(step_out) == 5:
-                            state, reward, terminated, truncated, _ = step_out
-                            done = terminated or truncated
-                        else:
-                            state, reward, done, _ = step_out
-                        ep_ret += reward
-                    episode_rewards_det.append(ep_ret)
-                
-                # Stochastic 평가
-                episode_rewards_stoch = []
-                step_count = 0
-                for ep in range(config.n_episodes):
-                    ep_seed = config.seed + 10000 + i * 100 + ep
-                    np.random.seed(ep_seed)
-                    try:
-                        env.action_space.seed(ep_seed)
-                        reset_result = env.reset(seed=ep_seed)
-                    except (TypeError, AttributeError):
-                        try:
-                            reset_result = env.reset(seed=ep_seed)
-                        except TypeError:
-                            if hasattr(env, 'seed'):
-                                env.seed(ep_seed)
-                            reset_result = env.reset()
-                    
-                    state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-                    state_tensor = torch.tensor(state.reshape(1, -1), device=config.device, dtype=torch.float32)
-                    done = False
-                    ep_ret = 0.0
-                    while not done:
-                        # 재현성을 위해 episode와 step 기반 시드 사용
-                        eval_seed = (config.seed if config.seed else 0) * 10000 + ep * 1000 + step_count
-                        # sample_actions를 사용하여 stochastic action 샘플링
-                        actions = actor_i.sample_actions(state_tensor, K=1, seed=eval_seed)
-                        action = actions[0].cpu().numpy().flatten()
-                        step_out = env.step(action)
-                        if len(step_out) == 5:
-                            state, reward, terminated, truncated, _ = step_out
-                            done = terminated or truncated
-                        else:
-                            state, reward, done, _ = step_out
-                        ep_ret += reward
-                        step_count += 1
-                    episode_rewards_stoch.append(ep_ret)
-                
-                actor_i.train()
-                
-                scores_det = np.asarray(episode_rewards_det)
-                scores_stoch = np.asarray(episode_rewards_stoch)
-                norm_score_det = env.get_normalized_score(scores_det.mean()) * 100.0
-                norm_score_stoch = env.get_normalized_score(scores_stoch.mean()) * 100.0
-                
-                det_avg = float(scores_det.mean())
-                det_score = float(norm_score_det)
-                stoch_avg = float(scores_stoch.mean())
-                stoch_score = float(norm_score_stoch)
+                # pogogo.py 스타일: base_seed = config.seed + 100 + i * 100
+                base_seed = config.seed + 100 + i * 100
+                det_avg, det_score, stoch_avg, stoch_score = eval_policy_multi(
+                    actor=actors[i],
+                    env=env,
+                    base_seed=base_seed,
+                    n_episodes=config.n_episodes,
+                    device=config.device,
+                    state_mean=state_mean,
+                    state_std=state_std,
+                )
                 
                 actor_results.append({
                     'det_avg': det_avg,
@@ -1170,8 +1257,7 @@ def train(config: TrainConfig):
                 evaluations[i].append(det_score)
                 
                 e = {
-                    "env_step": int(global_env_step),
-                    "update_step": int(global_update_step),
+                    "update_step": int(global_step),
                     "actor": int(i),
                     "det_score": det_score,
                     "det_avg": det_avg,
@@ -1182,122 +1268,61 @@ def train(config: TrainConfig):
             
             # wandb 로깅: 평가 메트릭 (pogogo.py 형식)
             if config.use_wandb:
-                eval_log_dict = {}
-                for i in range(config.num_actors):
-                    r = actor_results[i]
-                    eval_log_dict[f"eval/actor_{i}/det_score"] = r['det_score']
-                    eval_log_dict[f"eval/actor_{i}/det_avg"] = r['det_avg']
-                    eval_log_dict[f"eval/actor_{i}/stoch_score"] = r['stoch_score']
-                    eval_log_dict[f"eval/actor_{i}/stoch_avg"] = r['stoch_avg']
-                eval_log_dict["eval/global_step"] = global_env_step
-                wandb.log(eval_log_dict, step=global_env_step)
+                log_eval_wandb(actor_results, global_step)
             
-            last_eval_step = global_env_step
+            last_eval_step = global_step
 
     # 학습 완료 후 최종 평가 (pogogo.py 형식)
     print("\n" + "=" * 60, flush=True)
     print("Training completed!", flush=True)
     print("=" * 60, flush=True)
     
-    # 최종 평가: 각 actor마다 deterministic과 stochastic 평가
+    # 최종 평가: 각 actor마다 deterministic과 stochastic 평가 (pogogo.py 스타일)
     for i in range(config.num_actors):
         print(f"\n======== Final Evaluation: Actor {i} ========", flush=True)
-        actor_i = actors[i]
-        actor_i.eval()
         
         det_scores, stoch_scores = [], []
-        for r in range(5):  # 5 runs
-            # Deterministic 평가
-            episode_rewards_det = []
-            for ep in range(config.n_episodes):
-                ep_seed = 1000 + 100 * r + i * 1000 + ep
-                np.random.seed(ep_seed)
-                try:
-                    env.action_space.seed(ep_seed)
-                    reset_result = env.reset(seed=ep_seed)
-                except (TypeError, AttributeError):
-                    try:
-                        reset_result = env.reset(seed=ep_seed)
-                    except TypeError:
-                        if hasattr(env, 'seed'):
-                            env.seed(ep_seed)
-                        reset_result = env.reset()
-                
-                state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-                done = False
-                ep_ret = 0.0
-                while not done:
-                    action = actor_i.act(state, config.device)
-                    step_out = env.step(action)
-                    if len(step_out) == 5:
-                        state, reward, terminated, truncated, _ = step_out
-                        done = terminated or truncated
-                    else:
-                        state, reward, done, _ = step_out
-                    ep_ret += reward
-                episode_rewards_det.append(ep_ret)
+        for r in range(config.final_eval_runs):
+            # Deterministic 평가: base_seed = 1000 + 100 * r (pogogo.py 스타일)
+            base_seed_det = 1000 + 100 * r
+            _, det_score, _, _ = eval_policy_multi(
+                actor=actors[i],
+                env=env,
+                base_seed=base_seed_det,
+                n_episodes=config.final_eval_episodes,
+                device=config.device,
+                state_mean=state_mean,
+                state_std=state_std,
+            )
+            det_scores.append(det_score)
             
-            scores_det = np.asarray(episode_rewards_det)
-            norm_score_det = env.get_normalized_score(scores_det.mean()) * 100.0
-            det_scores.append(float(norm_score_det))
-            
-            # Stochastic 평가
-            episode_rewards_stoch = []
-            step_count = 0
-            for ep in range(config.n_episodes):
-                ep_seed = 2000 + 100 * r + i * 1000 + ep
-                np.random.seed(ep_seed)
-                try:
-                    env.action_space.seed(ep_seed)
-                    reset_result = env.reset(seed=ep_seed)
-                except (TypeError, AttributeError):
-                    try:
-                        reset_result = env.reset(seed=ep_seed)
-                    except TypeError:
-                        if hasattr(env, 'seed'):
-                            env.seed(ep_seed)
-                        reset_result = env.reset()
-                
-                state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-                state_tensor = torch.tensor(state.reshape(1, -1), device=config.device, dtype=torch.float32)
-                done = False
-                ep_ret = 0.0
-                while not done:
-                    eval_seed = ep_seed * 10000 + step_count
-                    # sample_actions를 사용하여 stochastic action 샘플링
-                    actions = actor_i.sample_actions(state_tensor, K=1, seed=eval_seed)
-                    action = actions[0].cpu().numpy().flatten()
-                    step_out = env.step(action)
-                    if len(step_out) == 5:
-                        state, reward, terminated, truncated, _ = step_out
-                        done = terminated or truncated
-                    else:
-                        state, reward, done, _ = step_out
-                    ep_ret += reward
-                    step_count += 1
-                episode_rewards_stoch.append(ep_ret)
-            
-            scores_stoch = np.asarray(episode_rewards_stoch)
-            norm_score_stoch = env.get_normalized_score(scores_stoch.mean()) * 100.0
-            stoch_scores.append(float(norm_score_stoch))
-        
-        actor_i.train()
+            # Stochastic 평가: base_seed = 2000 + 100 * r (pogogo.py 스타일)
+            base_seed_stoch = 2000 + 100 * r
+            _, _, _, stoch_score = eval_policy_multi(
+                actor=actors[i],
+                env=env,
+                base_seed=base_seed_stoch,
+                n_episodes=config.final_eval_episodes,
+                device=config.device,
+                state_mean=state_mean,
+                state_std=state_std,
+            )
+            stoch_scores.append(stoch_score)
         
         det_scores = np.array(det_scores, dtype=np.float32)
         stoch_scores = np.array(stoch_scores, dtype=np.float32)
         
-        print(f"[FINAL] Deterministic: mean={det_scores.mean():.3f}, std={det_scores.std():.3f} over 5x{config.n_episodes}", flush=True)
-        print(f"[FINAL] Stochastic:   mean={stoch_scores.mean():.3f}, std={stoch_scores.std():.3f} over 5x{config.n_episodes}", flush=True)
+        print(f"[FINAL] Deterministic: mean={det_scores.mean():.3f}, std={det_scores.std():.3f} over {config.final_eval_runs}x{config.final_eval_episodes}", flush=True)
+        print(f"[FINAL] Stochastic:   mean={stoch_scores.mean():.3f}, std={stoch_scores.std():.3f} over {config.final_eval_runs}x{config.final_eval_episodes}", flush=True)
         
         # wandb 로깅: 최종 평가 결과 (pogogo.py 형식)
         if config.use_wandb:
-            actor_suffix = f"_actor_{i}" if i is not None else ""
             wandb.log({
-                f"final{actor_suffix}/det_mean": float(det_scores.mean()),
-                f"final{actor_suffix}/det_std": float(det_scores.std()),
-                f"final{actor_suffix}/stoch_mean": float(stoch_scores.mean()),
-                f"final{actor_suffix}/stoch_std": float(stoch_scores.std()),
-            })
+                f"final_actor_{i}/det_mean": float(det_scores.mean()),
+                f"final_actor_{i}/det_std": float(det_scores.std()),
+                f"final_actor_{i}/stoch_mean": float(stoch_scores.mean()),
+                f"final_actor_{i}/stoch_std": float(stoch_scores.std()),
+            }, step=global_step)
         
         if evaluations[i]:
             final_score = evaluations[i][-1]
@@ -1344,8 +1369,7 @@ def train(config: TrainConfig):
         "log_interval": int(config.log_interval),
         "eval_freq": int(config.eval_freq),
         "checkpoint_freq": int(config.checkpoint_freq),
-        "final_env_step": int(global_env_step),
-        "final_update_step": int(global_update_step),
+        "final_step": int(global_step),
         "evaluations": {str(i): [float(x) for x in evaluations[i]] for i in range(config.num_actors)},
         "final_scores": {
             str(i): (float(evaluations[i][-1]) if len(evaluations[i]) > 0 else None)
@@ -1392,7 +1416,7 @@ def train(config: TrainConfig):
         if actor_targets[i] is not None:
             ckpt[f"actor_{i}_target"] = actor_targets[i].state_dict()
     
-    checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_env_step}.pt")
+    checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_step}.pt")
     torch.save(ckpt, checkpoint_file)
     print(f"Checkpoint 저장 완료: {checkpoint_file}", flush=True)
 

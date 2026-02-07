@@ -858,14 +858,66 @@ class CQLAlgorithm(PyTorchAlgorithmInterface):
     ) -> torch.Tensor:
         """CQL actor loss 계산"""
         observations, actions, rewards, next_observations, dones = batch
-        new_actions_i = actor.deterministic_actions(observations)
-        log_pi_i = torch.zeros(observations.size(0), device=observations.device)
+        
+        # Action 및 log_pi 계산
+        if actor_is_stochastic:
+            # Stochastic policy: 실제 log_pi 계산
+            if hasattr(actor, '__call__'):
+                # TanhGaussianMLP 등: need_log_prob=True 지원
+                try:
+                    new_actions_i, log_pi_i = actor(observations, need_log_prob=True)
+                    if log_pi_i is None:
+                        # log_pi가 None인 경우 직접 계산
+                        mean, log_std = actor.get_mean_logstd(observations)
+                        log_std = torch.clamp(log_std, -20.0, 2.0)
+                        std = torch.exp(log_std)
+                        from torch.distributions import Normal
+                        dist = Normal(mean, std)
+                        raw_action = dist.rsample()
+                        tanh_action = torch.tanh(raw_action)
+                        new_actions_i = tanh_action * actor.max_action
+                        log_pi_i = dist.log_prob(raw_action).sum(axis=-1)
+                        log_pi_i = log_pi_i - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
+                except (TypeError, AttributeError):
+                    # need_log_prob를 지원하지 않는 경우
+                    mean, log_std = actor.get_mean_logstd(observations)
+                    log_std = torch.clamp(log_std, -20.0, 2.0)
+                    std = torch.exp(log_std)
+                    from torch.distributions import Normal
+                    dist = Normal(mean, std)
+                    raw_action = dist.rsample()
+                    tanh_action = torch.tanh(raw_action)
+                    log_pi_i = dist.log_prob(raw_action).sum(axis=-1)
+                    log_pi_i = log_pi_i - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
+                    new_actions_i = tanh_action * actor.max_action
+            else:
+                # 다른 stochastic policy 타입
+                mean, log_std = actor.get_mean_logstd(observations)
+                log_std = torch.clamp(log_std, -20.0, 2.0)
+                std = torch.exp(log_std)
+                from torch.distributions import Normal
+                dist = Normal(mean, std)
+                raw_action = dist.rsample()
+                tanh_action = torch.tanh(raw_action)
+                log_pi_i = dist.log_prob(raw_action).sum(axis=-1)
+                log_pi_i = log_pi_i - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
+                new_actions_i = tanh_action * actor.max_action
+        else:
+            # Deterministic policy: log_pi = 0
+            new_actions_i = actor.deterministic_actions(observations)
+            log_pi_i = torch.zeros(observations.size(0), device=observations.device)
+        
         alpha_i, _ = trainer._alpha_and_alpha_loss(observations, log_pi_i)
         
         if trainer.total_it <= trainer.bc_steps:
-            # BC 단계
-            bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
-            return (alpha_i * log_pi_i.mean() - bc_loss).mean()
+            # BC 단계: 원래 CQL과 동일하게 log_prob 사용
+            if hasattr(actor, 'log_prob'):
+                log_probs = actor.log_prob(observations, actions)
+                return (alpha_i * log_pi_i.mean() - log_probs).mean()
+            else:
+                # log_prob를 지원하지 않는 경우 MSE 사용 (fallback)
+                bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
+                return (alpha_i * log_pi_i.mean() - bc_loss).mean()
         else:
             # CQL policy loss
             q_new = torch.min(
