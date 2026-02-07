@@ -124,6 +124,6 @@ PORL_sh/
 
 ## 참고
 
-- CORL: [Consistent Offline Reinforcement Learning](https://github.com/corl-team/CORL)
+- CORL: [Clean Offline Reinforcement Learning](https://github.com/corl-team/CORL)
 - POGO: Policy Optimization of Gradient flow for Offline Reinforcement Learning
 - D4RL: [Datasets for Deep Data-Driven Reinforcement Learning](https://github.com/Farama-Foundation/D4RL)
