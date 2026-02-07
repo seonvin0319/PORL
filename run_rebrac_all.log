@@ -1,0 +1,11 @@
+==========================================
+ReBRAC 전체 환경 순차 학습 (JAX)
+Seed: 0
+순서: halfcheetah → hopper → walker2d → antmaze
+각 도메인: medium → medium-replay → medium-expert
+==========================================
+
+[1/1] >>> 환경: halfcheetah-medium-v2
+    Config: configs/offline/pogo_multi/halfcheetah/medium_v2_rebrac.yaml
+    Log: results/rebrac/halfcheetah_medium_v2/seed_0/logs/rebrac_20260206_213807.log
+종료됨

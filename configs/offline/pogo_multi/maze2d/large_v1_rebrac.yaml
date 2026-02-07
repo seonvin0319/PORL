@@ -1,0 +1,40 @@
+algorithm: rebrac
+dataset_name: maze2d-large-v1
+train_seed: 0
+eval_seed: 42
+w2_weights:
+- 10.0
+- 10.0
+num_actors: 3
+actor_configs:
+- type: deterministic
+- type: deterministic
+- type: deterministic
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+sinkhorn_backend: auto
+actor_learning_rate: 1e-3
+critic_learning_rate: 1e-3
+hidden_dim: 256
+actor_n_hiddens: 3
+critic_n_hiddens: 3
+gamma: 0.99
+tau: 5e-3
+actor_bc_coef: 1.0
+critic_bc_coef: 1.0
+actor_ln: false
+critic_ln: true
+policy_noise: 0.2
+noise_clip: 0.5
+policy_freq: 2
+normalize_q: true
+batch_size: 1024
+num_epochs: 1000
+num_updates_on_epoch: 1000
+normalize_reward: false
+normalize_states: false
+eval_episodes: 10
+eval_freq: 5000  # PyTorch 버전과 동일하게 timestep 기반 (5000 timestep마다)
+project: PORL
+group: pogo-multi-rebrac
+name: pogo-multi-rebrac-maze2d-large-v1

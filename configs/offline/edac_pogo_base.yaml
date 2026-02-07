@@ -1,0 +1,47 @@
+# POGO Multi-Actor with EDAC algorithm
+# EDAC의 구조(Critic, Actor)를 그대로 사용하되, Actor만 multi-actor
+
+algorithm: edac  # 필수: 사용할 알고리즘 선택
+
+# 환경 설정
+# env: command line에서 --env로 override됨 (기본값: halfcheetah-medium-v2)
+env: halfcheetah-medium-v2
+seed: 0  # command line에서 --seed로 override 가능
+eval_freq: 5000
+n_episodes: 10
+max_timesteps: 1000000
+
+# POGO Multi-Actor
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+# expert: [100.0, 100.0], 나머지: [10.0, 10.0] (command line에서 override 가능)
+w2_weights: [10.0, 10.0]
+num_actors: 3
+# actor_configs: 각 actor의 설정 (선택사항, 명시하지 않으면 알고리즘별 기본값 사용)
+# EDAC는 자동으로 TanhGaussian policy 사용 (원래 알고리즘과 동일: Normal 샘플링 후 tanh 적용)
+# TanhGaussian은 closed-form W2 사용 불가하므로 Sinkhorn 사용
+# 필요시 override 가능: actor_configs: [{type: tanh_gaussian}, {type: tanh_gaussian}, {type: tanh_gaussian}]
+
+# Sinkhorn
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+sinkhorn_backend: "tensorized"
+
+# EDAC 파라미터 (EDAC 구조 그대로 사용)
+num_critics: 10
+eta: 1.0
+alpha_learning_rate: 3e-4
+actor_lr: 3e-4
+
+# 공통
+batch_size: 256
+discount: 0.99
+tau: 0.005
+buffer_size: 2000000
+normalize: true
+normalize_reward: false
+
+# Wandb
+use_wandb: true
+project: PORL
+group: POGO-Multi-EDAC
+name: POGO-Multi-EDAC

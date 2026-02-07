@@ -1,0 +1,36 @@
+# POGO Multi-Actor with AWAC algorithm
+# AWAC의 구조(Critic, Actor)를 그대로 사용하되, Actor만 multi-actor
+
+algorithm: awac  # 필수: 사용할 알고리즘 선택
+
+env: halfcheetah-medium-v2
+seed: 0
+eval_freq: 5000
+n_episodes: 10
+max_timesteps: 1000000
+
+# POGO Multi-Actor
+w2_weights: [10.0, 10.0, 10.0]
+num_actors: 3
+
+# Sinkhorn
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+sinkhorn_backend: "tensorized"
+
+# AWAC 파라미터 (AWAC 구조 그대로 사용)
+awac_lambda: 1.0
+exp_adv_max: 100.0
+actor_lr: 3e-4
+
+# 공통
+batch_size: 256
+discount: 0.99
+tau: 0.005
+buffer_size: 2000000
+normalize: true
+normalize_reward: false
+
+project: CORL
+group: pogo-multi-awac
+name: pogo-multi-awac
