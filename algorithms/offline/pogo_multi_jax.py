@@ -26,12 +26,11 @@ import pyrallis
 import wandb
 from flax.core import FrozenDict
 from flax.training.train_state import TrainState
+from ott.geometry import pointcloud
+from ott.solvers.linear import solve as sinkhorn_solve
 # JAX utilities and ReBRAC imports (for now, can be extended to other algorithms)
 from .rebrac import (
     Config as BaseConfig,
-    DetActor,
-    Critic,
-    EnsembleCritic,
     CriticTrainState,
     ActorTrainState,
     Metrics,
@@ -39,113 +38,25 @@ from .rebrac import (
     update_critic,
     update_actor,
     update_td3,
-    make_env,
-    wrap_env,
-    evaluate,
-    pytorch_init,
-    uniform_init,
-    identity,
-    compute_mean_std,
-    normalize_states,
-    qlearning_dataset,
+    ReBRACAlgorithm,
 )
+# Environment utilities (PyTorch의 utils_pytorch와 대응)
+from .utils_jax import wrap_env, evaluate, qlearning_dataset
+# Network classes and utilities
+from algorithms.networks.critics_jax import DetActor, Critic, EnsembleCritic
+from algorithms.networks.mlp_jax import pytorch_init, uniform_init, identity, compute_mean_std, normalize_states
+# JAX Actor implementations
+from algorithms.networks.actors_jax import (
+    GaussianMLP,
+    TanhGaussianMLP,
+    StochasticMLP,
+    DeterministicMLP,
+)
+# AlgorithmInterface and ActorConfig
+from .utils_jax import AlgorithmInterface, ActorConfig
 
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
-
-
-@dataclass
-class ActorConfig:
-    """Actor 설정을 그룹화하는 dataclass"""
-    params: FrozenDict
-    module: nn.Module
-    is_stochastic: bool
-    is_gaussian: bool
-
-
-@dataclass
-class AlgorithmInterface:
-    """알고리즘별 인터페이스 정의
-    다른 알고리즘(ReBRAC 외)으로 확장할 때 이 인터페이스를 구현하면 됨
-    """
-    def update_critic(
-        self,
-        key: jax.random.PRNGKey,
-        actor: ActorTrainState,
-        critic: CriticTrainState,
-        batch: Dict[str, jax.Array],
-        **kwargs
-    ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
-        """Critic 업데이트"""
-        raise NotImplementedError
-    
-    def compute_actor_loss(
-        self,
-        actor: ActorTrainState,
-        critic: CriticTrainState,
-        batch: Dict[str, jax.Array],
-        **kwargs
-    ) -> jax.Array:
-        """Actor loss 계산"""
-        raise NotImplementedError
-
-
-class ReBRACAlgorithm(AlgorithmInterface):
-    """ReBRAC 알고리즘 구현체"""
-    def __init__(
-        self,
-        beta: float,
-        gamma: float,
-        tau: float,
-        policy_noise: float,
-        noise_clip: float,
-        normalize_q: bool,
-    ):
-        self.beta = beta
-        self.gamma = gamma
-        self.tau = tau
-        self.policy_noise = policy_noise
-        self.noise_clip = noise_clip
-        self.normalize_q = normalize_q
-    
-    def update_critic(
-        self,
-        key: jax.random.PRNGKey,
-        actor: ActorTrainState,
-        critic: CriticTrainState,
-        batch: Dict[str, jax.Array],
-        metrics: Metrics,
-    ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
-        """ReBRAC critic 업데이트"""
-        return update_critic(
-            key,
-            actor,
-            critic,
-            batch,
-            gamma=self.gamma,
-            beta=self.beta,
-            tau=self.tau,
-            policy_noise=self.policy_noise,
-            noise_clip=self.noise_clip,
-            metrics=metrics,
-        )
-    
-    def compute_actor_loss(
-        self,
-        actor_params: FrozenDict,
-        actor_module: nn.Module,
-        critic: CriticTrainState,
-        batch: Dict[str, jax.Array],
-    ) -> jax.Array:
-        """ReBRAC actor loss 계산"""
-        # Actor0의 mean 사용
-        mean, _ = actor_module.get_mean_std(actor_params, batch["states"])
-        bc_penalty = jnp.sum((mean - batch["actions"]) ** 2, axis=-1)
-        q_values = critic.apply_fn(critic.params, batch["states"], mean).min(0)
-        lmbda = 1.0
-        if self.normalize_q:
-            lmbda = jax.lax.stop_gradient(1.0 / jnp.abs(q_values).mean())
-        return (self.beta * bc_penalty - lmbda * q_values).mean()
 
 
 @dataclass
@@ -160,7 +71,7 @@ class Config(BaseConfig):
     # Sinkhorn 설정 (Actor1+용, Gaussian이 아닌 경우에만 사용)
     sinkhorn_K: int = 4
     sinkhorn_blur: float = 0.05
-    sinkhorn_backend: str = "auto"  # JAX에서는 ott-jax 사용
+    sinkhorn_backend: str = "auto"  # JAX에서는 ott-jax 사용 (실제로 OTT 사용)
     
     def __post_init__(self):
         super().__post_init__()
@@ -184,539 +95,7 @@ class Config(BaseConfig):
         self.actor_configs = self.actor_configs[:self.num_actors]
 
 
-class GaussianMLP(nn.Module):
-    """POGO Gaussian Actor: mean에 tanh가 적용된 상태에서 샘플링
-    mean = tanh(...) * max_action (bounded mean)
-    그 mean, std로 Gaussian 샘플링
-    Closed form W2 distance 사용 가능
-    """
-    action_dim: int
-    max_action: float = 1.0
-    hidden_dim: int = 256
-    layernorm: bool = False
-    n_hiddens: int = 2
-    log_std_min: float = -20.0
-    log_std_max: float = 2.0
-    
-    # Policy 타입 속성 (클래스 변수)
-    is_gaussian: bool = True
-    is_stochastic: bool = True
-
-    @nn.compact
-    def __call__(self, state: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        """
-        Forward pass: state -> (mean, log_std)
-        Returns:
-            mean: [B, action_dim] (tanh applied, bounded)
-            log_std: [B, action_dim]
-        """
-        s_d, h_d = state.shape[-1], self.hidden_dim
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        # Mean head (with tanh)
-        mean_head = nn.Sequential([
-            nn.Dense(
-                self.action_dim,
-                kernel_init=uniform_init(1e-3),
-                bias_init=uniform_init(1e-3),
-            ),
-            nn.tanh,
-        ])
-        
-        # Log std head (learnable parameter)
-        log_std = self.param(
-            'log_std',
-            nn.initializers.zeros,
-            (self.action_dim,),
-        )
-        log_std = jnp.broadcast_to(log_std, (state.shape[0], self.action_dim))
-        
-        # Build base network
-        base_net = nn.Sequential(layers)
-        x = base_net(state)
-        mean = mean_head(x) * self.max_action
-        
-        # Clamp log_std
-        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
-        
-        return mean, log_std
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: mean"""
-        mean, _ = self.apply(params, state)
-        return mean
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: [B, K, action_dim]
-        mean에 tanh가 적용된 상태에서 샘플링
-        """
-        mean, log_std = self.apply(params, state)  # [B, action_dim]
-        std = jnp.exp(log_std)  # [B, action_dim]
-        
-        B = state.shape[0]
-        # Sample noise: [B, K, action_dim]
-        noise = jax.random.normal(key, (B, K, self.action_dim))
-        
-        # Expand mean and std: [B, K, action_dim]
-        mean_expanded = jnp.expand_dims(mean, axis=1)  # [B, 1, action_dim]
-        mean_expanded = jnp.tile(mean_expanded, (1, K, 1))  # [B, K, action_dim]
-        std_expanded = jnp.expand_dims(std, axis=1)  # [B, 1, action_dim]
-        std_expanded = jnp.tile(std_expanded, (1, K, 1))  # [B, K, action_dim]
-        
-        # Sample actions (mean은 이미 bounded)
-        actions = mean_expanded + std_expanded * noise
-        actions = jnp.clip(actions, -self.max_action, self.max_action)
-        return actions
-    
-    def get_mean_std(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """Get mean and std: [B, action_dim]"""
-        mean, log_std = self.apply(params, state)
-        std = jnp.exp(log_std)
-        return mean, std
-
-
-class TanhGaussianMLP(nn.Module):
-    """POGO TanhGaussian Actor: unbounded Gaussian에서 샘플링 후 tanh 적용
-    mean = ... (unbounded)
-    mean, std로 Gaussian 샘플링 (unbounded space)
-    그 다음 tanh를 적용하여 bounded로 만듦
-    Closed form W2 사용 불가 (Sinkhorn 사용)
-    """
-    action_dim: int
-    max_action: float = 1.0
-    hidden_dim: int = 256
-    layernorm: bool = False
-    n_hiddens: int = 2
-    log_std_min: float = -20.0
-    log_std_max: float = 2.0
-    
-    # Policy 타입 속성 (클래스 변수)
-    is_gaussian: bool = False
-    is_stochastic: bool = True
-
-    @nn.compact
-    def __call__(self, state: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        """
-        Forward pass: state -> (mean, log_std)
-        Returns:
-            mean: [B, action_dim] (unbounded)
-            log_std: [B, action_dim]
-        """
-        s_d, h_d = state.shape[-1], self.hidden_dim
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        # Mean head (no tanh)
-        mean_head = nn.Dense(
-            self.action_dim,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )
-        
-        # Log std head (learnable parameter)
-        log_std = self.param(
-            'log_std',
-            nn.initializers.zeros,
-            (self.action_dim,),
-        )
-        log_std = jnp.broadcast_to(log_std, (state.shape[0], self.action_dim))
-        
-        # Build base network
-        base_net = nn.Sequential(layers)
-        x = base_net(state)
-        mean = mean_head(x)  # Unbounded
-        
-        # Clamp log_std
-        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
-        
-        return mean, log_std
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: tanh(mean) * max_action"""
-        mean, _ = self.apply(params, state)
-        return jnp.tanh(mean) * self.max_action
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: [B, K, action_dim]
-        unbounded Gaussian에서 샘플링 후 tanh 적용
-        """
-        mean, log_std = self.apply(params, state)  # [B, action_dim]
-        std = jnp.exp(log_std)  # [B, action_dim]
-        
-        B = state.shape[0]
-        # Sample noise: [B, K, action_dim]
-        noise = jax.random.normal(key, (B, K, self.action_dim))
-        
-        # Expand mean and std: [B, K, action_dim]
-        mean_expanded = jnp.expand_dims(mean, axis=1)  # [B, 1, action_dim]
-        mean_expanded = jnp.tile(mean_expanded, (1, K, 1))  # [B, K, action_dim]
-        std_expanded = jnp.expand_dims(std, axis=1)  # [B, 1, action_dim]
-        std_expanded = jnp.tile(std_expanded, (1, K, 1))  # [B, K, action_dim]
-        
-        # Sample actions from unbounded Gaussian
-        actions_unbounded = mean_expanded + std_expanded * noise
-        
-        # Apply tanh to make bounded
-        actions = jnp.tanh(actions_unbounded) * self.max_action
-        return actions
-    
-    def get_mean_std(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """Get mean and std: [B, action_dim]"""
-        mean, log_std = self.apply(params, state)
-        std = jnp.exp(log_std)
-        return mean, std
-
-
-class GaussianMLP(nn.Module):
-    """POGO Gaussian Actor: state -> (mean, log_std) -> action
-    진짜 unbounded Gaussian policy (tanh 없음)
-    """
-    action_dim: int
-    max_action: float = 1.0
-    hidden_dim: int = 256
-    layernorm: bool = False
-    n_hiddens: int = 2
-    log_std_min: float = -20.0
-    log_std_max: float = 2.0
-
-    @nn.compact
-    def __call__(self, state: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        """
-        Forward pass: state -> (mean, log_std)
-        Returns:
-            mean: [B, action_dim] (no tanh - unbounded)
-            log_std: [B, action_dim]
-        """
-        s_d, h_d = state.shape[-1], self.hidden_dim
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        # Mean head (no tanh)
-        mean_head = nn.Dense(
-            self.action_dim,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )
-        
-        # Log std head (learnable parameter)
-        log_std = self.param(
-            'log_std',
-            nn.initializers.zeros,
-            (self.action_dim,),
-        )
-        log_std = jnp.broadcast_to(log_std, (state.shape[0], self.action_dim))
-        
-        # Build base network
-        base_net = nn.Sequential(layers)
-        x = base_net(state)
-        mean = mean_head(x)  # No tanh - unbounded
-        
-        # Clamp log_std
-        log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
-        
-        return mean, log_std
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: mean (clamped)"""
-        mean, _ = self.apply(params, state)
-        return jnp.clip(mean, -self.max_action, self.max_action)
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: [B, K, action_dim]"""
-        mean, log_std = self.apply(params, state)  # [B, action_dim]
-        std = jnp.exp(log_std)  # [B, action_dim]
-        
-        B = state.shape[0]
-        # Sample noise: [B, K, action_dim]
-        noise = jax.random.normal(key, (B, K, self.action_dim))
-        
-        # Expand mean and std: [B, K, action_dim]
-        mean_expanded = jnp.expand_dims(mean, axis=1)  # [B, 1, action_dim]
-        mean_expanded = jnp.tile(mean_expanded, (1, K, 1))  # [B, K, action_dim]
-        std_expanded = jnp.expand_dims(std, axis=1)  # [B, 1, action_dim]
-        std_expanded = jnp.tile(std_expanded, (1, K, 1))  # [B, K, action_dim]
-        
-        # Sample actions (unbounded, then clamp)
-        actions = mean_expanded + std_expanded * noise
-        actions = jnp.clip(actions, -self.max_action, self.max_action)
-        return actions
-    
-    def get_mean_std(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """Get mean and std: [B, action_dim]"""
-        mean, log_std = self.apply(params, state)
-        std = jnp.exp(log_std)
-        return mean, std
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: mean"""
-        mean, _ = self.apply(params, state)
-        return mean
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: [B, K, action_dim]"""
-        mean, log_std = self.apply(params, state)  # [B, action_dim]
-        std = jnp.exp(log_std)  # [B, action_dim]
-        
-        B = state.shape[0]
-        # Sample noise: [B, K, action_dim]
-        noise = jax.random.normal(key, (B, K, self.action_dim))
-        
-        # Expand mean and std: [B, K, action_dim]
-        mean_expanded = jnp.expand_dims(mean, axis=1)  # [B, 1, action_dim]
-        mean_expanded = jnp.tile(mean_expanded, (1, K, 1))  # [B, K, action_dim]
-        std_expanded = jnp.expand_dims(std, axis=1)  # [B, 1, action_dim]
-        std_expanded = jnp.tile(std_expanded, (1, K, 1))  # [B, K, action_dim]
-        
-        # Sample actions: [B, K, action_dim]
-        actions = mean_expanded + std_expanded * noise
-        actions = jnp.clip(actions, -self.max_action, self.max_action)
-        return actions
-    
-    def get_mean_std(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-    ) -> Tuple[jax.Array, jax.Array]:
-        """Get mean and std: [B, action_dim]"""
-        mean, log_std = self.apply(params, state)
-        std = jnp.exp(log_std)
-        return mean, std
-
-
-class StochasticMLP(nn.Module):
-    """POGO Stochastic Actor: state + z -> action"""
-    action_dim: int
-    max_action: float = 1.0
-    hidden_dim: int = 256
-    layernorm: bool = False
-    n_hiddens: int = 2
-    
-    # Policy 타입 속성 (클래스 변수)
-    is_gaussian: bool = False
-    is_stochastic: bool = True
-
-    @nn.compact
-    def __call__(self, state: jax.Array, z: jax.Array) -> jax.Array:
-        """
-        Forward pass: state + z -> action
-        z must be provided (for deterministic, use z=0)
-        """
-        # Concatenate state and z
-        x = jnp.concatenate([state, z], axis=-1)
-        
-        # Build network
-        s_d, h_d = x.shape[-1], self.hidden_dim
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        layers += [
-            nn.Dense(
-                self.action_dim,
-                kernel_init=uniform_init(1e-3),
-                bias_init=uniform_init(1e-3),
-            ),
-            nn.tanh,
-        ]
-        net = nn.Sequential(layers)
-        actions = net(x) * self.max_action
-        return actions
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: z = 0"""
-        z = jnp.zeros((state.shape[0], self.action_dim), dtype=state.dtype)
-        return self.apply(params, state, z)
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: [B, K, action_dim]"""
-        B = state.shape[0]
-        # Sample z: [B, K, action_dim]
-        z = jax.random.normal(key, (B, K, self.action_dim))
-        
-        # Expand state: [B, K, state_dim]
-        state_expanded = jnp.expand_dims(state, axis=1)  # [B, 1, state_dim]
-        state_expanded = jnp.tile(state_expanded, (1, K, 1))  # [B, K, state_dim]
-        
-        # Flatten for batch processing: [B*K, state_dim], [B*K, action_dim]
-        state_flat = state_expanded.reshape(B * K, -1)
-        z_flat = z.reshape(B * K, self.action_dim)
-        
-        # Forward pass: [B*K, action_dim]
-        actions_flat = self.apply(params, state_flat, z_flat)
-        
-        # Reshape back: [B, K, action_dim]
-        actions = actions_flat.reshape(B, K, self.action_dim)
-        return actions
-
-
-class DeterministicMLP(nn.Module):
-    """POGO Deterministic Actor: state -> action"""
-    action_dim: int
-    max_action: float = 1.0
-    hidden_dim: int = 256
-    layernorm: bool = False
-    n_hiddens: int = 2
-    
-    # Policy 타입 속성 (클래스 변수)
-    is_gaussian: bool = False
-    is_stochastic: bool = False
-
-    @nn.compact
-    def __call__(self, state: jax.Array) -> jax.Array:
-        s_d, h_d = state.shape[-1], self.hidden_dim
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        layers += [
-            nn.Dense(
-                self.action_dim,
-                kernel_init=uniform_init(1e-3),
-                bias_init=uniform_init(1e-3),
-            ),
-            nn.tanh,
-        ]
-        net = nn.Sequential(layers)
-        actions = net(state) * self.max_action
-        return actions
-
-    def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action (same as forward)"""
-        return self.apply(params, state)
-
-    def sample_actions(
-        self,
-        params: FrozenDict,
-        state: jax.Array,
-        key: jax.random.PRNGKey,
-        K: int = 1,
-    ) -> jax.Array:
-        """Sample K actions: deterministic, so just repeat"""
-        actions = self.apply(params, state)  # [B, action_dim]
-        actions = jnp.expand_dims(actions, axis=1)  # [B, 1, action_dim]
-        actions = jnp.tile(actions, (1, K, 1))  # [B, K, action_dim]
-        return actions
+# Actor classes are now imported from algorithms.networks.actors_jax
 
 
 def sinkhorn_distance_jax(
@@ -726,57 +105,38 @@ def sinkhorn_distance_jax(
     num_iterations: int = 100,
 ) -> jax.Array:
     """
-    Sinkhorn distance 계산 (JAX 구현)
+    Sinkhorn distance 계산 (OTT-jax 사용)
     
     Args:
         x: [B, K, action_dim] 첫 번째 분포의 샘플
         y: [B, K, action_dim] 두 번째 분포의 샘플 (detached)
         blur: regularization parameter (epsilon)
-        num_iterations: Sinkhorn 알고리즘 반복 횟수
+        num_iterations: Sinkhorn 알고리즘 반복 횟수 (OTT에서는 max_iterations로 전달)
     
     Returns:
         [B] 각 state에 대한 Sinkhorn distance
     """
     B, K, action_dim = x.shape
     
-    # Cost matrix: [B, K, K] - L2 distance between samples
-    # x: [B, K, action_dim], y: [B, K, action_dim]
-    x_expanded = jnp.expand_dims(x, axis=2)  # [B, K, 1, action_dim]
-    y_expanded = jnp.expand_dims(y, axis=1)  # [B, 1, K, action_dim]
+    # Uniform weights for each point cloud
+    a = jnp.ones((B, K)) / K  # [B, K]
+    b = jnp.ones((B, K)) / K  # [B, K]
     
-    # Pairwise L2 distance: [B, K, K]
-    cost = jnp.sum((x_expanded - y_expanded) ** 2, axis=-1)  # [B, K, K]
-    
-    # Sinkhorn algorithm
-    # Initialize: uniform distribution
-    u = jnp.ones((B, K)) / K  # [B, K]
-    v = jnp.ones((B, K)) / K  # [B, K]
-    
-    # Kernel: K = exp(-cost / blur)
-    K_matrix = jnp.exp(-cost / blur)  # [B, K, K]
-    
-    # Sinkhorn iterations using scan
-    def sinkhorn_step(carry, _):
-        u, v = carry
-        # Update u
-        u_new = 1.0 / (K_matrix @ v[..., None] + 1e-8)  # [B, K, 1]
-        u_new = u_new.squeeze(-1)  # [B, K]
-        u_new = u_new / (u_new.sum(axis=-1, keepdims=True) + 1e-8)  # Normalize
+    def compute_sinkhorn_for_batch(x_i, y_i, a_i, b_i):
+        """Single batch Sinkhorn computation using OTT"""
+        # Create geometry object
+        geom = pointcloud.PointCloud(x_i, y_i, epsilon=blur)
         
-        # Update v
-        v_new = 1.0 / ((u_new[..., None] * K_matrix).sum(axis=1) + 1e-8)  # [B, K]
-        v_new = v_new / (v_new.sum(axis=-1, keepdims=True) + 1e-8)  # Normalize
+        # Solve Sinkhorn
+        out = sinkhorn_solve(geom, a_i, b_i, max_iterations=num_iterations)
         
-        return (u_new, v_new), None
+        # Extract distance (transport cost)
+        return out.reg_ot_cost
     
-    (u, v), _ = jax.lax.scan(sinkhorn_step, (u, v), None, length=num_iterations)
+    # Vectorize over batch dimension
+    distances = jax.vmap(compute_sinkhorn_for_batch)(x, y, a, b)  # [B]
     
-    # Compute Sinkhorn distance
-    # W = sum(u * K * v * cost)
-    transport = u[..., None] * K_matrix * v[:, None, :]  # [B, K, K]
-    distance = (transport * cost).sum(axis=(1, 2))  # [B]
-    
-    return distance
+    return distances
 
 
 def closed_form_w2_gaussian(
@@ -1122,7 +482,10 @@ def main(config: Config):
     key, actor_keys, critic_key = jax.random.split(key, config.num_actors + 2)
     actor_keys = jax.random.split(actor_keys, config.num_actors)
 
-    eval_env = make_env(config.dataset_name, seed=config.eval_seed)
+    eval_env = gym.make(config.dataset_name)
+    eval_env.seed(config.eval_seed)
+    eval_env.action_space.seed(config.eval_seed)
+    eval_env.observation_space.seed(config.eval_seed)
     eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]

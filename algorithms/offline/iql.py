@@ -265,8 +265,8 @@ class ImplicitQLearning:
         log_dict: Dict,
     ):
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        if hasattr(self.actor, "log_prob"):
-            lp = self.actor.log_prob(observations, actions)
+        if hasattr(self.actor, "log_prob_actions"):
+            lp = self.actor.log_prob_actions(observations, actions)
             bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
         else:
             policy_out = self.actor(observations)

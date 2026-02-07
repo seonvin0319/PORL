@@ -146,7 +146,7 @@ class AdvantageWeightedActorCritic:
                 torch.exp(adv / self._awac_lambda), self._exp_adv_max
             )
 
-        action_log_prob = self._actor.log_prob(states, actions)
+        action_log_prob = self._actor.log_prob_actions(states, actions)
         loss = (-action_log_prob * weights).mean()
         return loss
 

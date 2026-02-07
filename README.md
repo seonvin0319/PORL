@@ -9,7 +9,7 @@ POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 mul
 ```bash
 pip install geomloss PyYAML
 # JAX 버전 사용 시
-pip install jax jaxlib flax optax
+pip install jax jaxlib flax optax ott-jax
 ```
 
 ### 실행 예시
@@ -79,22 +79,25 @@ POGO(**Policy Optimization as a Gradient Flow in Offline RL**)는 **JKO (Jordan-
 ```
 PORL/
 ├── algorithms/
-│   ├── networks/               # 통합 네트워크 패키지
+│   ├── networks/               # 통합 네트워크 패키지 (PyTorch & JAX)
 │   │   ├── __init__.py        # 모든 클래스 re-export
-│   │   ├── actors.py          # BaseActor, GaussianMLP, TanhGaussianMLP, DeterministicMLP 등
-│   │   ├── critics.py         # FullyConnectedQFunction, EnsembleCritic, VectorizedLinear 등
-│   │   ├── mlp.py             # build_mlp, init_module_weights, create_generator 등
+│   │   ├── actors.py           # PyTorch Actor (GaussianMLP, TanhGaussianMLP, DeterministicMLP 등)
+│   │   ├── actors_jax.py      # JAX Actor (GaussianMLP, TanhGaussianMLP, DeterministicMLP 등)
+│   │   ├── critics.py         # PyTorch Critic (FullyConnectedQFunction, EnsembleCritic 등)
+│   │   ├── critics_jax.py     # JAX Critic 구현
+│   │   ├── mlp.py             # PyTorch MLP 유틸리티 (build_mlp, init_module_weights 등)
+│   │   ├── mlp_jax.py         # JAX MLP 유틸리티
 │   │   ├── adapters.py        # ActorAPI(Protocol), PolicyAdapter
 │   │   └── policy_call.py     # get_action, act_for_eval, sample_K_actions
 │   └── offline/
 │       ├── pogo_multi_main.py      # PyTorch 버전 메인 스크립트
 │       ├── pogo_multi_jax.py       # JAX 버전 메인 스크립트
-│       ├── pogo_policies_jax.py    # JAX Policy 구현
 │       ├── utils_pytorch.py        # PyTorch 유틸리티 (soft_update, ReplayBuffer, eval_actor 등)
 │       ├── utils_jax.py            # JAX 유틸리티 (AlgorithmInterface)
 │       ├── iql.py, cql.py, ...      # 각 알고리즘 구현
 │       │   └── compute_energy_function()  # Actor1+용 energy function (알고리즘별 구현)
-│       ├── POGO_MULTI_README.md      # 상세 문서
+│       ├── fql.py                   # FQL 알고리즘 (JAX, Flow Policy 포함)
+│       ├── rebrac.py                # ReBRAC 알고리즘 (JAX)
 │       └── CODE_EVALUATION_REPORT.md # 코드 평가 보고서
 ├── configs/
 │   └── offline/
@@ -172,7 +175,7 @@ Policy 타입에 따라 자동 선택:
 | 조건 | 방식 |
 |------|------|
 | Both Gaussian | Closed-form W2 (`||μ1-μ2||² + ||σ1-σ2||²`) |
-| Both Stochastic (not Gaussian) | Sinkhorn (GeomLoss) |
+| Both Stochastic (not Gaussian) | Sinkhorn (PyTorch: GeomLoss, JAX: OTT-jax) |
 | At least one Deterministic | L2 |
 
 ### Policy 타입 (`algorithms/networks/`)
@@ -180,8 +183,8 @@ Policy 타입에 따라 자동 선택:
 | 타입 | W2 | 속성 |
 |------|-----|------|
 | GaussianMLP | Closed-form | `is_gaussian=True`, `is_stochastic=True` |
-| TanhGaussianMLP | Sinkhorn | `is_gaussian=False`, `is_stochastic=True` |
-| StochasticMLP | Sinkhorn | `is_gaussian=False`, `is_stochastic=True` |
+| TanhGaussianMLP | Sinkhorn (PyTorch: GeomLoss, JAX: OTT-jax) | `is_gaussian=False`, `is_stochastic=True` |
+| StochasticMLP | Sinkhorn (PyTorch: GeomLoss, JAX: OTT-jax) | `is_gaussian=False`, `is_stochastic=True` |
 | DeterministicMLP | L2 | `is_gaussian=False`, `is_stochastic=False` |
 
 **참고**: 모든 Actor는 `ActorAPI(Protocol)` 인터페이스를 구현하며, `deterministic_actions`, `sample_actions`, `log_prob_actions` 메서드를 제공합니다.
@@ -190,11 +193,14 @@ Policy 타입에 따라 자동 선택:
 
 | 파일 | 역할 |
 |------|------|
-| `pogo_multi_main.py` | 알고리즘 선택, Actor 생성, `_train_multi_actor`로 통합 학습 |
-| `algorithms/networks/` | 통합 네트워크 패키지 (Actor, Critic, MLP 유틸리티) |
-| `algorithms/networks/actors.py` | 모든 Actor 클래스 (GaussianMLP, TanhGaussianMLP 등) |
+| `pogo_multi_main.py` | PyTorch 버전: 알고리즘 선택, Actor 생성, `_train_multi_actor`로 통합 학습 |
+| `pogo_multi_jax.py` | JAX 버전: ReBRAC/FQL 알고리즘, multi-actor 학습 |
+| `algorithms/networks/` | 통합 네트워크 패키지 (PyTorch & JAX Actor, Critic, MLP 유틸리티) |
+| `algorithms/networks/actors.py` | PyTorch Actor 클래스 (GaussianMLP, TanhGaussianMLP 등) |
+| `algorithms/networks/actors_jax.py` | JAX Actor 클래스 (GaussianMLP, TanhGaussianMLP 등) |
 | `algorithms/networks/adapters.py` | `ActorAPI(Protocol)` 인터페이스 정의 |
-| `utils_pytorch.py` | 공통 유틸리티 (soft_update, ReplayBuffer, eval_actor, normalize_states 등) |
+| `utils_pytorch.py` | PyTorch 공통 유틸리티 (soft_update, ReplayBuffer, eval_actor 등) |
+| `utils_jax.py` | JAX 공통 유틸리티 (AlgorithmInterface) |
 | `policy_call.py` | 평가/학습 시 policy 호출 통일 |
 
 ### Actor 생성 (`_create_actors`)
@@ -232,21 +238,28 @@ W2/Loss 계산 시 **미분 가능한** action 필요. `deterministic_actions()`
 
 #### 5. 기존 알고리즘 파일
 
-`iql.py`, `awac.py` 등은 **수정하지 않음**. `compute_energy_function`만 POGO용으로 추가. `train()`/`update()` 내부 로직은 그대로 사용하여 Actor0를 업데이트합니다.
+`iql.py`, `awac.py`, `cql.py` 등은 **최소한의 수정만 수행**:
+- `compute_energy_function`만 POGO용으로 추가
+- `log_prob()` → `log_prob_actions()` 통일 (CQL, IQL, AWAC)
+- `train()`/`update()` 내부 로직은 그대로 사용하여 Actor0를 업데이트합니다.
 
-#### 6. 코드 리팩토링 (2026)
+#### 6. 코드 리팩토링 및 개선 (2026)
 
-- **네트워크 통합**: `algorithms/offline/networks.py` → `algorithms/networks/` 패키지로 분리
-  - `actors.py`: 모든 Actor 클래스
-  - `critics.py`: 모든 Critic 클래스
-  - `mlp.py`: MLP 빌딩 및 초기화 유틸리티
+- **네트워크 통합**: `algorithms/networks/` 패키지로 통합
+  - `actors.py` / `actors_jax.py`: PyTorch/JAX Actor 클래스
+  - `critics.py` / `critics_jax.py`: PyTorch/JAX Critic 클래스
+  - `mlp.py` / `mlp_jax.py`: MLP 빌딩 및 초기화 유틸리티
   - `adapters.py`: `ActorAPI(Protocol)` 인터페이스
 - **유틸리티 통합**: 중복 함수들을 `algorithms/offline/utils_pytorch.py`로 통합
   - `soft_update`, `ReplayBuffer`, `eval_actor`, `normalize_states`, `set_seed`, `wandb_init` 등
 - **인터페이스 명확화**: `ActorAPI(Protocol)`로 모든 Actor의 공통 인터페이스 정의
   - `deterministic_actions(states) -> [B, A]`
   - `sample_actions(states, K=1, seed=None) -> [B, K, A]`
-  - `log_prob_actions(states, actions) -> [B]`
+  - `log_prob_actions(states, actions) -> [B]` (PyTorch & JAX 모두 구현)
+- **최근 개선사항**:
+  - ✅ JAX Actor에 `log_prob_actions()` 메서드 추가 완료
+  - ✅ JAX Sinkhorn 구현을 OTT-jax 라이브러리 사용으로 변경
+  - ✅ PyTorch 알고리즘(CQL, IQL, AWAC)에서 `log_prob()` → `log_prob_actions()` 통일
 
 ## 설치 및 실행
 
@@ -256,7 +269,7 @@ W2/Loss 계산 시 **미분 가능한** action 필요. `deterministic_actions()`
 pip install -r requirements/requirements.txt
 pip install geomloss PyYAML
 # JAX 버전 사용 시
-pip install jax jaxlib flax optax
+pip install jax jaxlib flax optax ott-jax
 export D4RL_SUPPRESS_IMPORT_ERROR=1
 export MUJOCO_GL=egl
 ```
@@ -278,7 +291,8 @@ python -m algorithms.offline.pogo_multi_jax \
 ## 문제 해결
 
 - **Import 에러**: `python -m algorithms.offline.pogo_multi_main` 형식으로 실행
-- **GeomLoss**: `pip install geomloss`
+- **GeomLoss**: `pip install geomloss` (PyTorch 버전용)
+- **OTT-jax**: `pip install ott-jax` (JAX 버전용)
 - **Headless**: `export MUJOCO_GL=egl`
 - **Wandb**: config `use_wandb: true`(기본)면 활성화. 비활성화: `--no_wandb` 또는 config에 `use_wandb: false`
 - **공통 env**: run 스크립트는 `env_common.sh`를 source하여 D4RL/MUJOCO/PYTHONUNBUFFERED 설정

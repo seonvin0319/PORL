@@ -251,7 +251,7 @@ class ContinuousCQL:
         log_pi: torch.Tensor,
     ) -> torch.Tensor:
         if self.total_it <= self.bc_steps:
-            log_probs = self.actor.log_prob(observations, actions)
+            log_probs = self.actor.log_prob_actions(observations, actions)
             policy_loss = (alpha * log_pi - log_probs).mean()
         else:
             q_new_actions = torch.min(
@@ -541,12 +541,8 @@ class ContinuousCQL:
                 raise ValueError("CQL compute_energy_function requires actions in BC stage")
             act = actions
             if hasattr(actor, "log_prob_actions"):
-                return (alpha_i * log_pi - actor.log_prob_actions(obs, act, keepdim=False)).mean()
-            if hasattr(actor, "log_prob"):
-                lp = actor.log_prob(obs, act)
-                if lp.dim() > 1:
-                    lp = lp.squeeze(-1)
-                return (alpha_i * log_pi - lp).mean()
+                return (alpha_i * log_pi - actor.log_prob_actions(obs, act)).mean()
+            # Fallback: use MSE if log_prob_actions is not available
             return ((new_a - act) ** 2).sum(dim=1).mean()
         # CQL stage: alpha * log_pi(new_a) - Q(new_a)
         q_new = torch.min(self.critic_1(obs, new_a), self.critic_2(obs, new_a))
