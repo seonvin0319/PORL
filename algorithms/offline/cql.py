@@ -17,6 +17,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
+from .networks import TanhGaussianMLP
+from .utils_pytorch import (
+    ReplayBuffer,
+    set_seed,
+    wandb_init,
+    eval_actor,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+)
 
 TensorBatch = List[torch.Tensor]
 
@@ -82,142 +92,6 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
         target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -316,71 +190,8 @@ class ReparameterizedTanhGaussian(nn.Module):
         return action_sample, log_prob
 
 
-class TanhGaussianPolicy(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        max_action: float,
-        log_std_multiplier: float = 1.0,
-        log_std_offset: float = -1.0,
-        orthogonal_init: bool = False,
-        no_tanh: bool = False,
-    ):
-        super().__init__()
-        self.observation_dim = state_dim
-        self.action_dim = action_dim
-        self.max_action = max_action
-        self.orthogonal_init = orthogonal_init
-        self.no_tanh = no_tanh
-
-        self.base_network = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 2 * action_dim),
-        )
-
-        init_module_weights(self.base_network)
-
-        self.log_std_multiplier = Scalar(log_std_multiplier)
-        self.log_std_offset = Scalar(log_std_offset)
-        self.tanh_gaussian = ReparameterizedTanhGaussian(no_tanh=no_tanh)
-
-    def log_prob(
-        self, observations: torch.Tensor, actions: torch.Tensor
-    ) -> torch.Tensor:
-        if actions.ndim == 3:
-            observations = extend_and_repeat(observations, 1, actions.shape[1])
-        base_network_output = self.base_network(observations)
-        mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
-        log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
-        _, log_probs = self.tanh_gaussian(mean, log_std, False)
-        return log_probs
-
-    def forward(
-        self,
-        observations: torch.Tensor,
-        deterministic: bool = False,
-        repeat: bool = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if repeat is not None:
-            observations = extend_and_repeat(observations, 1, repeat)
-        base_network_output = self.base_network(observations)
-        mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
-        log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
-        actions, log_probs = self.tanh_gaussian(mean, log_std, deterministic)
-        return self.max_action * actions, log_probs
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu"):
-        state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        with torch.no_grad():
-            actions, _ = self(state, not self.training)
-        return actions.cpu().data.numpy().flatten()
+# TanhGaussianPolicy는 pogo_policies.py의 TanhGaussianMLP로 통합됨
+TanhGaussianPolicy = TanhGaussianMLP
 
 
 class FullyConnectedQFunction(nn.Module):
@@ -738,54 +549,62 @@ class ContinuousCQL:
         return qf_loss, alpha_prime, alpha_prime_loss
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
-        (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
-        ) = batch
-        self.total_it += 1
-
-        new_actions, log_pi = self.actor(observations)
-
+        """기존 CQL 학습 메서드 (단일 actor용)"""
+        log_dict = {}
+        observations, actions, rewards, next_observations, dones = batch
+        
+        # Policy action 및 log_prob 계산
+        new_actions, log_pi = self.actor(observations, need_log_prob=True)
+        if log_pi is None:
+            # log_prob가 None인 경우 계산
+            from torch.distributions import Normal
+            mean, log_std = self.actor.get_mean_logstd(observations)
+            log_std = torch.clamp(log_std, -20.0, 2.0)
+            std = torch.exp(log_std)
+            dist = Normal(mean, std)
+            raw_action = dist.rsample()
+            tanh_action = torch.tanh(raw_action)
+            log_pi = dist.log_prob(raw_action).sum(axis=-1)
+            log_pi = log_pi - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
         alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
-
-        """ Policy loss """
-        policy_loss = self._policy_loss(
-            observations, actions, new_actions, alpha, log_pi
-        )
-
-        log_dict = dict(
-            log_pi=log_pi.mean().item(),
-            policy_loss=policy_loss.item(),
-            alpha_loss=alpha_loss.item(),
-            alpha=alpha.item(),
-        )
-
-        """ Q function loss """
+        
+        # Q loss 계산 및 업데이트
         qf_loss, alpha_prime, alpha_prime_loss = self._q_loss(
             observations, actions, next_observations, rewards, dones, alpha, log_dict
         )
-
-        if self.use_automatic_entropy_tuning:
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-
-        self.actor_optimizer.zero_grad()
-        policy_loss.backward()
-        self.actor_optimizer.step()
-
+        
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
         qf_loss.backward(retain_graph=True)
         self.critic_1_optimizer.step()
         self.critic_2_optimizer.step()
-
+        
+        # Alpha 업데이트
+        if self.use_automatic_entropy_tuning:
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+        
+        # Alpha prime 업데이트
+        if self.cql_lagrange:
+            self.alpha_prime_optimizer.zero_grad()
+            alpha_prime_loss.backward(retain_graph=True)
+            self.alpha_prime_optimizer.step()
+        
+        # Policy loss 계산 및 업데이트
+        policy_loss = self._policy_loss(
+            observations, actions, new_actions, alpha, log_pi
+        )
+        self.actor_optimizer.zero_grad()
+        policy_loss.backward()
+        self.actor_optimizer.step()
+        log_dict["policy_loss"] = policy_loss.item()
+        
+        # Target network 업데이트
         if self.total_it % self.target_update_period == 0:
             self.update_target_network(self.soft_target_update_rate)
-
+        
+        self.total_it += 1
         return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
@@ -894,13 +713,8 @@ def train(config: TrainConfig):
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
     critic_2_optimizer = torch.optim.Adam(list(critic_2.parameters()), config.qf_lr)
 
-    actor = TanhGaussianPolicy(
-        state_dim,
-        action_dim,
-        max_action,
-        log_std_multiplier=config.policy_log_std_multiplier,
-        orthogonal_init=config.orthogonal_init,
-    ).to(config.device)
+    # CQL의 원래 TanhGaussianPolicy는 3개의 hidden layer 사용 (256 -> 256 -> 256)
+    actor = TanhGaussianMLP(state_dim, action_dim, max_action, hidden_dim=256, n_hiddens=3).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
 
     kwargs = {
@@ -981,6 +795,99 @@ def train(config: TrainConfig):
                 {"d4rl_normalized_score": normalized_eval_score},
                 step=trainer.total_it,
             )
+
+
+# ============================================================================
+# POGO Multi-Actor Interface 구현
+# ============================================================================
+
+from typing import Any, Dict, List
+
+# 순환 참조 방지를 위해 파일 끝에서 import
+from .utils_pytorch import PyTorchAlgorithmInterface
+
+
+class CQLAlgorithm(PyTorchAlgorithmInterface):
+    """CQL 알고리즘의 POGO Multi-Actor 인터페이스 구현"""
+    def __init__(self, trainer: 'ContinuousCQL', cql_actor: nn.Module):
+        self.trainer = trainer
+        self.cql_actor = cql_actor  # CQL의 원래 TanhGaussianPolicy (Q loss 계산용)
+    
+    def update_critic(
+        self,
+        trainer: Any,
+        batch: TensorBatch,
+        log_dict: Dict[str, float],
+        **kwargs
+    ) -> Dict[str, float]:
+        """CQL의 Q loss 계산 및 업데이트"""
+        trainer.total_it += 1
+        observations, actions, rewards, next_observations, dones = batch
+        new_actions, log_pi = self.cql_actor(observations)
+        alpha, alpha_loss = trainer._alpha_and_alpha_loss(observations, log_pi)
+        
+        # CQL의 원래 _q_loss 메서드 호출
+        qf_loss, alpha_prime, alpha_prime_loss = trainer._q_loss(
+            observations, actions, next_observations, rewards, dones, alpha, log_dict
+        )
+        
+        # Q 업데이트
+        trainer.critic_1_optimizer.zero_grad()
+        trainer.critic_2_optimizer.zero_grad()
+        qf_loss.backward(retain_graph=True)
+        trainer.critic_1_optimizer.step()
+        trainer.critic_2_optimizer.step()
+        
+        # Alpha 업데이트
+        if trainer.use_automatic_entropy_tuning:
+            trainer.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            trainer.alpha_optimizer.step()
+        
+        return log_dict
+    
+    def compute_actor_loss(
+        self,
+        trainer: Any,
+        actor: nn.Module,
+        batch: TensorBatch,
+        actor_idx: int,
+        actor_is_stochastic: bool,
+        seed_base: int,
+        **kwargs
+    ) -> torch.Tensor:
+        """CQL actor loss 계산"""
+        observations, actions, rewards, next_observations, dones = batch
+        new_actions_i = actor.deterministic_actions(observations)
+        log_pi_i = torch.zeros(observations.size(0), device=observations.device)
+        alpha_i, _ = trainer._alpha_and_alpha_loss(observations, log_pi_i)
+        
+        if trainer.total_it <= trainer.bc_steps:
+            # BC 단계
+            bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
+            return (alpha_i * log_pi_i.mean() - bc_loss).mean()
+        else:
+            # CQL policy loss
+            q_new = torch.min(
+                trainer.critic_1(observations, new_actions_i),
+                trainer.critic_2(observations, new_actions_i)
+            )
+            return (alpha_i * log_pi_i.mean() - q_new).mean()
+    
+    def update_target_networks(
+        self,
+        trainer: Any,
+        actors: List[nn.Module],
+        actor_targets: List[nn.Module],
+        tau: float,
+        **kwargs
+    ) -> None:
+        """CQL target network 업데이트"""
+        if trainer.total_it % trainer.target_update_period == 0:
+            trainer.update_target_network(trainer.soft_target_update_rate)
+            for actor, actor_target in zip(actors, actor_targets):
+                for p, tp in zip(actor.parameters(), actor_target.parameters()):
+                    tp.data.copy_(trainer.soft_target_update_rate * p.data + (1 - trainer.soft_target_update_rate) * tp.data)
 
 
 if __name__ == "__main__":

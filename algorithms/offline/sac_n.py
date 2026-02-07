@@ -18,6 +18,14 @@ import torch.nn as nn
 import wandb
 from torch.distributions import Normal
 from tqdm import trange
+from .networks import TanhGaussianMLP, VectorizedLinear
+from .utils_pytorch import (
+    ReplayBuffer,
+    set_seed,
+    wandb_init,
+    eval_actor,
+    wrap_env,
+)
 
 @dataclass
 class TrainConfig:
@@ -67,107 +75,6 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
         target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    def scale_reward(reward):
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        raise NotImplementedError
 
 
 # SAC Actor & Critic implementation
@@ -199,34 +106,35 @@ class VectorizedLinear(nn.Module):
         return x @ self.weight + self.bias
 
 
+# Actor는 pogo_policies.py의 TanhGaussianMLP로 통합됨
+# SAC-N/EDAC 방식: mu와 log_std를 별도 레이어로 출력 (separate_mu_logstd=True)
 class Actor(nn.Module):
     def __init__(
         self, state_dim: int, action_dim: int, hidden_dim: int, max_action: float = 1.0
     ):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+        # SAC-N/EDAC는 3개의 hidden layer 사용, log_std clipping: -5 ~ 2
+        # separate_mu_logstd=True: mu와 log_std를 별도 레이어로 출력 (원래 구조와 동일)
+        self.policy = TanhGaussianMLP(
+            state_dim, action_dim, max_action,
+            hidden_dim=hidden_dim, n_hiddens=3,
+            log_std_min=-5, log_std_max=2,
+            separate_mu_logstd=True
         )
-        # with separate layers works better than with Linear(hidden_dim, 2 * action_dim)
-        self.mu = nn.Linear(hidden_dim, action_dim)
-        self.log_sigma = nn.Linear(hidden_dim, action_dim)
-
-        # init as in the EDAC paper
-        for layer in self.trunk[::2]:
-            torch.nn.init.constant_(layer.bias, 0.1)
-
-        torch.nn.init.uniform_(self.mu.weight, -1e-3, 1e-3)
-        torch.nn.init.uniform_(self.mu.bias, -1e-3, 1e-3)
-        torch.nn.init.uniform_(self.log_sigma.weight, -1e-3, 1e-3)
-        torch.nn.init.uniform_(self.log_sigma.bias, -1e-3, 1e-3)
-
         self.action_dim = action_dim
         self.max_action = max_action
+        
+        # SAC-N/EDAC 초기화: base layers의 Linear 레이어 bias를 0.1로 초기화
+        for i in range(self.policy.n_hiddens):
+            layer = getattr(self.policy, f'l{i+1}')
+            if isinstance(layer, nn.Linear):
+                torch.nn.init.constant_(layer.bias, 0.1)
+        
+        # mu와 log_std_head의 weight/bias를 uniform(-1e-3, 1e-3)로 초기화
+        torch.nn.init.uniform_(self.policy.mu.weight, -1e-3, 1e-3)
+        torch.nn.init.uniform_(self.policy.mu.bias, -1e-3, 1e-3)
+        torch.nn.init.uniform_(self.policy.log_std_head.weight, -1e-3, 1e-3)
+        torch.nn.init.uniform_(self.policy.log_std_head.bias, -1e-3, 1e-3)
 
     def forward(
         self,
@@ -234,32 +142,11 @@ class Actor(nn.Module):
         deterministic: bool = False,
         need_log_prob: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        hidden = self.trunk(state)
-        mu, log_sigma = self.mu(hidden), self.log_sigma(hidden)
-
-        # clipping params from EDAC paper, not as in SAC paper (-20, 2)
-        log_sigma = torch.clip(log_sigma, -5, 2)
-        policy_dist = Normal(mu, torch.exp(log_sigma))
-
-        if deterministic:
-            action = mu
-        else:
-            action = policy_dist.rsample()
-
-        tanh_action, log_prob = torch.tanh(action), None
-        if need_log_prob:
-            # change of variables formula (SAC paper, appendix C, eq 21)
-            log_prob = policy_dist.log_prob(action).sum(axis=-1)
-            log_prob = log_prob - torch.log(1 - tanh_action.pow(2) + 1e-6).sum(axis=-1)
-
-        return tanh_action * self.max_action, log_prob
+        return self.policy(state, deterministic=deterministic, need_log_prob=need_log_prob)
 
     @torch.no_grad()
     def act(self, state: np.ndarray, device: str) -> np.ndarray:
-        deterministic = not self.training
-        state = torch.tensor(state, device=device, dtype=torch.float32)
-        action = self(state, deterministic=deterministic)[0].cpu().numpy()
-        return action
+        return self.policy.act(state, device)
 
 
 class VectorizedCritic(nn.Module):
@@ -445,24 +332,6 @@ class SACN:
         self.alpha = self.log_alpha.exp().detach()
 
 
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.array(episode_rewards)
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -558,9 +427,9 @@ def train(config: TrainConfig):
             eval_returns = eval_actor(
                 env=eval_env,
                 actor=actor,
+                device=config.device,
                 n_episodes=config.eval_episodes,
                 seed=config.eval_seed,
-                device=config.device,
             )
             eval_log = {
                 "eval/reward_mean": np.mean(eval_returns),
@@ -581,6 +450,88 @@ def train(config: TrainConfig):
                 )
 
     wandb.finish()
+
+
+# ============================================================================
+# POGO Multi-Actor Interface 구현
+# ============================================================================
+
+from typing import Any, Dict, List
+
+# 순환 참조 방지를 위해 파일 끝에서 import
+from .utils_pytorch import PyTorchAlgorithmInterface
+
+TensorBatch = List[torch.Tensor]
+
+
+class SACNAlgorithm(PyTorchAlgorithmInterface):
+    """SAC-N 알고리즘의 POGO Multi-Actor 인터페이스 구현"""
+    def __init__(self, trainer: 'SACN'):
+        self.trainer = trainer
+    
+    def update_critic(
+        self,
+        trainer: Any,
+        batch: TensorBatch,
+        log_dict: Dict[str, float],
+        **kwargs
+    ) -> Dict[str, float]:
+        """SAC-N의 Alpha, Critic 업데이트"""
+        if not hasattr(trainer, "total_it"):
+            trainer.total_it = 0
+        trainer.total_it += 1
+        state, action, reward, next_state, done = [arr.to(trainer.device) for arr in batch]
+        trainer.actor = kwargs['actors'][0]  # 임시로 첫 번째 actor 연결
+        
+        # Alpha update
+        alpha_loss = trainer._alpha_loss(state)
+        trainer.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        trainer.alpha_optimizer.step()
+        trainer.alpha = trainer.log_alpha.exp().detach()
+        
+        # Critic update
+        critic_loss = trainer._critic_loss(state, action, reward, next_state, done)
+        trainer.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        trainer.critic_optimizer.step()
+        
+        log_dict["alpha_loss"] = float(alpha_loss.item())
+        log_dict["critic_loss"] = float(critic_loss.item())
+        log_dict["alpha"] = float(trainer.alpha.item())
+        return log_dict
+    
+    def compute_actor_loss(
+        self,
+        trainer: Any,
+        actor: nn.Module,
+        batch: TensorBatch,
+        actor_idx: int,
+        actor_is_stochastic: bool,
+        seed_base: int,
+        **kwargs
+    ) -> torch.Tensor:
+        """SAC-N actor loss 계산"""
+        state, action, reward, next_state, done = [arr.to(trainer.device) for arr in batch]
+        pi_i = actor.deterministic_actions(state)
+        q_value_dist = trainer.critic(state, pi_i)
+        q_value_min = q_value_dist.min(0).values
+        log_pi_i = torch.zeros(state.size(0), device=state.device)
+        return (trainer.alpha * log_pi_i - q_value_min).mean()
+    
+    def update_target_networks(
+        self,
+        trainer: Any,
+        actors: List[nn.Module],
+        actor_targets: List[nn.Module],
+        tau: float,
+        **kwargs
+    ) -> None:
+        """SAC-N target network 업데이트"""
+        soft_update(trainer.target_critic, trainer.critic, tau=trainer.tau)
+        for actor, actor_target in zip(actors, actor_targets):
+            for p, tp in zip(actor.parameters(), actor_target.parameters()):
+                tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,16 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from .networks import GaussianMLP, DeterministicMLP, Squeeze
+from .utils_pytorch import (
+    ReplayBuffer,
+    set_seed,
+    wandb_init,
+    eval_actor,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+)
 
 TensorBatch = List[torch.Tensor]
 
@@ -68,39 +78,7 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
         target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
-) -> gym.Env:
-    # PEP 8: E731 do not assign a lambda expression, use a def
-    def normalize_state(state):
-        return (
-            state - state_mean
-        ) / state_std  # epsilon should be already added in std.
-
-    def scale_reward(reward):
-        # Please be careful, here reward is multiplied by scale!
-        return reward_scale * reward
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
-    return env
-
-
-class ReplayBuffer:
+class ImplicitQLearning:
     def __init__(
         self,
         state_dim: int,
@@ -162,48 +140,6 @@ class ReplayBuffer:
         raise NotImplementedError
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -232,6 +168,73 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
 
 def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
+
+
+class MLP(nn.Module):
+    """Multi-Layer Perceptron (IQL용)"""
+    def __init__(
+        self,
+        dims,
+        activation_fn: Callable[[], nn.Module] = nn.ReLU,
+        output_activation_fn: Callable[[], nn.Module] = None,
+        squeeze_output: bool = False,
+        dropout: Optional[float] = None,
+    ):
+        super().__init__()
+        n_dims = len(dims)
+        if n_dims < 2:
+            raise ValueError("MLP requires at least two dims (input and output)")
+
+        layers = []
+        for i in range(n_dims - 2):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(activation_fn())
+
+            if dropout is not None:
+                layers.append(nn.Dropout(dropout))
+
+        layers.append(nn.Linear(dims[-2], dims[-1]))
+        if output_activation_fn is not None:
+            layers.append(output_activation_fn())
+        if squeeze_output:
+            if dims[-1] != 1:
+                raise ValueError("Last dim must be 1 when squeezing")
+            layers.append(Squeeze(-1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class TwinQ(nn.Module):
+    """Twin Q-network for IQL"""
+    def __init__(
+        self, state_dim: int, action_dim: int, hidden_dim: int = 256, n_hidden: int = 2
+    ):
+        super().__init__()
+        dims = [state_dim + action_dim, *([hidden_dim] * n_hidden), 1]
+        self.q1 = MLP(dims, squeeze_output=True)
+        self.q2 = MLP(dims, squeeze_output=True)
+
+    def both(
+        self, state: torch.Tensor, action: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sa = torch.cat([state, action], 1)
+        return self.q1(sa), self.q2(sa)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return torch.min(*self.both(state, action))
+
+
+class ValueFunction(nn.Module):
+    """Value function for IQL"""
+    def __init__(self, state_dim: int, hidden_dim: int = 256, n_hidden: int = 2):
+        super().__init__()
+        dims = [state_dim, *([hidden_dim] * n_hidden), 1]
+        self.v = MLP(dims, squeeze_output=True)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.v(state)
 
 
 class Squeeze(nn.Module):
@@ -278,68 +281,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class GaussianPolicy(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        act_dim: int,
-        max_action: float,
-        hidden_dim: int = 256,
-        n_hidden: int = 2,
-        dropout: Optional[float] = None,
-    ):
-        super().__init__()
-        self.net = MLP(
-            [state_dim, *([hidden_dim] * n_hidden), act_dim],
-            output_activation_fn=nn.Tanh,
-        )
-        self.log_std = nn.Parameter(torch.zeros(act_dim, dtype=torch.float32))
-        self.max_action = max_action
-
-    def forward(self, obs: torch.Tensor) -> Normal:
-        mean = self.net(obs)
-        std = torch.exp(self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX))
-        return Normal(mean, std)
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu"):
-        state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        dist = self(state)
-        action = dist.mean if not self.training else dist.sample()
-        action = torch.clamp(self.max_action * action, -self.max_action, self.max_action)
-        return action.cpu().data.numpy().flatten()
-
-
-class DeterministicPolicy(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        act_dim: int,
-        max_action: float,
-        hidden_dim: int = 256,
-        n_hidden: int = 2,
-        dropout: Optional[float] = None,
-    ):
-        super().__init__()
-        self.net = MLP(
-            [state_dim, *([hidden_dim] * n_hidden), act_dim],
-            output_activation_fn=nn.Tanh,
-            dropout=dropout,
-        )
-        self.max_action = max_action
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs)
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu"):
-        state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        return (
-            torch.clamp(self(state) * self.max_action, -self.max_action, self.max_action)
-            .cpu()
-            .data.numpy()
-            .flatten()
-        )
+# GaussianPolicy와 DeterministicPolicy는 pogo_policies.py의 GaussianMLP와 DeterministicMLP로 통합됨
 
 
 class TwinQ(nn.Module):
@@ -405,8 +347,28 @@ class ImplicitQLearning:
         self.total_it = 0
         self.device = device
 
+    def train(self, batch: TensorBatch) -> Dict[str, float]:
+        """기존 IQL 학습 메서드 (단일 actor용)"""
+        log_dict = {}
+        observations, actions, rewards, next_observations, dones = batch
+        
+        # V function 업데이트
+        adv = self._update_v(observations, actions, log_dict)
+        
+        # Q function 업데이트
+        with torch.no_grad():
+            next_v = self.vf(next_observations)
+        rewards = rewards.squeeze(dim=-1)
+        dones = dones.squeeze(dim=-1)
+        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        
+        # Policy 업데이트
+        self._update_policy(adv, observations, actions, log_dict)
+        
+        return log_dict
+
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
-        # Update value function
+        """Value function 업데이트 및 advantage 계산"""
         with torch.no_grad():
             target_q = self.q_target(observations, actions)
 
@@ -428,6 +390,7 @@ class ImplicitQLearning:
         terminals: torch.Tensor,
         log_dict: Dict,
     ):
+        """Q function 업데이트"""
         targets = rewards + (1.0 - terminals.float()) * self.discount * next_v.detach()
         qs = self.qf.both(observations, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
@@ -439,6 +402,13 @@ class ImplicitQLearning:
         # Update target Q network
         soft_update(self.q_target, self.qf, self.tau)
 
+    def _compute_advantage(self, observations, actions) -> torch.Tensor:
+        """Advantage 계산 (업데이트 없이)"""
+        with torch.no_grad():
+            target_q = self.q_target(observations, actions)
+        v = self.vf(observations)
+        return target_q - v
+
     def _update_policy(
         self,
         adv: torch.Tensor,
@@ -446,46 +416,19 @@ class ImplicitQLearning:
         actions: torch.Tensor,
         log_dict: Dict,
     ):
+        """Policy 업데이트 (기존 train 메서드용)"""
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+        # pogo_policies의 policy는 forward()가 tensor를 반환
         policy_out = self.actor(observations)
-        if isinstance(policy_out, torch.distributions.Distribution):
-            bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
-        elif torch.is_tensor(policy_out):
-            if policy_out.shape != actions.shape:
-                raise RuntimeError("Actions shape missmatch")
-            bc_losses = torch.sum((policy_out - actions) ** 2, dim=1)
-        else:
-            raise NotImplementedError
+        if policy_out.shape != actions.shape:
+            raise RuntimeError("Actions shape missmatch")
+        bc_losses = torch.sum((policy_out - actions) ** 2, dim=1)
         policy_loss = torch.mean(exp_adv * bc_losses)
         log_dict["actor_loss"] = policy_loss.item()
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
-
-    def train(self, batch: TensorBatch) -> Dict[str, float]:
-        self.total_it += 1
-        (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
-        ) = batch
-        log_dict = {}
-
-        with torch.no_grad():
-            next_v = self.vf(next_observations)
-        # Update value function
-        adv = self._update_v(observations, actions, log_dict)
-        rewards = rewards.squeeze(dim=-1)
-        dones = dones.squeeze(dim=-1)
-        # Update Q function
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-        # Update actor
-        self._update_policy(adv, observations, actions, log_dict)
-
-        return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -561,13 +504,9 @@ def train(config: TrainConfig):
     q_network = TwinQ(state_dim, action_dim).to(config.device)
     v_network = ValueFunction(state_dim).to(config.device)
     actor = (
-        DeterministicPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
+        DeterministicMLP(state_dim, action_dim, max_action)
         if config.iql_deterministic
-        else GaussianPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
+        else GaussianMLP(state_dim, action_dim, max_action)
     ).to(config.device)
     v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
     q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
@@ -637,6 +576,92 @@ def train(config: TrainConfig):
             wandb.log(
                 {"d4rl_normalized_score": normalized_eval_score}, step=trainer.total_it
             )
+
+
+# ============================================================================
+# POGO Multi-Actor Interface 구현
+# ============================================================================
+
+from typing import Any, Dict, List
+
+# 순환 참조 방지를 위해 파일 끝에서 import
+from .utils_pytorch import PyTorchAlgorithmInterface
+
+TensorBatch = List[torch.Tensor]
+
+
+class IQLAlgorithm(PyTorchAlgorithmInterface):
+    """IQL 알고리즘의 POGO Multi-Actor 인터페이스 구현"""
+    def __init__(self, trainer: 'ImplicitQLearning'):
+        self.trainer = trainer
+    
+    def update_critic(
+        self,
+        trainer: Any,
+        batch: TensorBatch,
+        log_dict: Dict[str, float],
+        **kwargs
+    ) -> Dict[str, float]:
+        """IQL의 V, Q 업데이트"""
+        trainer.total_it += 1
+        observations, actions, rewards, next_observations, dones = batch
+        
+        # V function 업데이트
+        trainer._update_v(observations, actions, log_dict)
+        
+        # Q function 업데이트
+        with torch.no_grad():
+            next_v = trainer.vf(next_observations)
+        rewards = rewards.squeeze(dim=-1)
+        dones = dones.squeeze(dim=-1)
+        trainer._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        
+        return log_dict
+    
+    def compute_actor_loss(
+        self,
+        trainer: Any,
+        actor: nn.Module,
+        batch: TensorBatch,
+        actor_idx: int,
+        actor_is_stochastic: bool,
+        seed_base: int,
+        **kwargs
+    ) -> torch.Tensor:
+        """IQL actor loss 계산"""
+        observations, actions = batch[0], batch[1]
+        
+        # Advantage 계산
+        adv = trainer._compute_advantage(observations, actions)
+        exp_adv = torch.exp(trainer.beta * adv).clamp(max=EXP_ADV_MAX)
+        
+        # Actor action 계산
+        if actor_is_stochastic:
+            mean_i = actor.sample_actions(observations, K=1, seed=seed_base)[:, 0, :] if not hasattr(actor, 'get_mean_std') else actor.get_mean_std(observations)[0]
+        else:
+            mean_i = actor.deterministic_actions(observations)
+        
+        if actor_idx == 0:
+            # Actor0: IQL BC loss
+            bc_losses = torch.sum((mean_i - actions) ** 2, dim=1)
+            return torch.mean(exp_adv * bc_losses)
+        else:
+            # Actor1+: Q 기반 loss
+            Q_i = trainer.qf(observations, mean_i)
+            return -Q_i.mean()
+    
+    def update_target_networks(
+        self,
+        trainer: Any,
+        actors: List[nn.Module],
+        actor_targets: List[nn.Module],
+        tau: float,
+        **kwargs
+    ) -> None:
+        """IQL target network 업데이트"""
+        for actor, actor_target in zip(actors, actor_targets):
+            for p, tp in zip(actor.parameters(), actor_target.parameters()):
+                tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
 
 
 if __name__ == "__main__":

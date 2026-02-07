@@ -7,7 +7,6 @@ os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # For reproducibility
 
 import math
 import uuid
-from copy import deepcopy
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union
@@ -24,7 +23,6 @@ import pyrallis
 import wandb
 from flax.core import FrozenDict
 from flax.training.train_state import TrainState
-from tqdm.auto import trange
 
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
@@ -33,7 +31,8 @@ default_bias_init = nn.initializers.zeros
 @dataclass
 class Config:
     # wandb params
-    project: str = "CORL"
+    entity: str = "seonvin0319"
+    project: str = "PORL"  # 기본값은 PORL
     group: str = "rebrac"
     name: str = "rebrac"
     # model params
@@ -61,7 +60,7 @@ class Config:
     normalize_states: bool = False
     # evaluation params
     eval_episodes: int = 10
-    eval_every: int = 5
+    eval_freq: int = int(5e3)  # Update step 기반 평가 주기
     # general params
     train_seed: int = 0
     eval_seed: int = 42
@@ -314,7 +313,7 @@ class ReplayBuffer:
         indices = jax.random.randint(
             key, shape=(batch_size,), minval=0, maxval=self.size
         )
-        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        batch = jax.tree.map(lambda arr: arr[indices], self.data)
         return batch
 
     def get_moments(self, modality: str) -> Tuple[jax.Array, jax.Array]:
@@ -334,24 +333,28 @@ class ReplayBuffer:
 
 @chex.dataclass(frozen=True)
 class Metrics:
+    """순수 PyTree 기반 Metrics (deepcopy 제거, JAX 친화적)"""
     accumulators: Dict[str, Tuple[jax.Array, jax.Array]]
 
     @staticmethod
     def create(metrics: Sequence[str]) -> "Metrics":
-        init_metrics = {key: (jnp.array([0.0]), jnp.array([0.0])) for key in metrics}
+        init_metrics = {key: (jnp.array(0.0), jnp.array(0.0)) for key in metrics}
         return Metrics(accumulators=init_metrics)
 
     def update(self, updates: Dict[str, jax.Array]) -> "Metrics":
-        new_accumulators = deepcopy(self.accumulators)
-        for key, value in updates.items():
-            acc, steps = new_accumulators[key]
-            new_accumulators[key] = (acc + value, steps + 1)
-
+        """순수 함수형 업데이트 (deepcopy 제거)"""
+        new_accumulators = {}
+        for key in self.accumulators.keys():
+            acc, steps = self.accumulators[key]
+            if key in updates:
+                new_accumulators[key] = (acc + updates[key], steps + 1)
+            else:
+                new_accumulators[key] = (acc, steps)
         return self.replace(accumulators=new_accumulators)
 
     def compute(self) -> Dict[str, np.ndarray]:
         # cumulative_value / total_steps
-        return {k: np.array(v[0] / v[1]) for k, v in self.accumulators.items()}
+        return {k: np.array(v[0] / v[1]) if v[1] > 0 else np.array(0.0) for k, v in self.accumulators.items()}
 
 
 def normalize(
@@ -397,17 +400,45 @@ def evaluate(
     num_episodes: int,
     seed: int,
 ) -> np.ndarray:
-    env.seed(seed)
-    env.action_space.seed(seed)
-    env.observation_space.seed(seed)
-
+    """Evaluate policy over multiple episodes
+    
+    Args:
+        env: Gym environment
+        params: Policy parameters
+        action_fn: Action function (params, obs) -> action
+        num_episodes: Number of episodes to evaluate
+        seed: Base seed for evaluation
+    
+    Returns:
+        Array of episode returns [num_episodes]
+    """
     returns = []
-    for _ in trange(num_episodes, desc="Eval", leave=False):
-        obs, done = env.reset(), False
+    for ep in range(num_episodes):
+        # 각 episode마다 시드 재설정 (pogogo.py와 동일)
+        ep_seed = seed + ep
+        np.random.seed(ep_seed)  # antmaze 등 reset 시 전역 np.random 쓰는 env용
+        try:
+            env.action_space.seed(ep_seed)
+            reset_result = env.reset(seed=ep_seed)
+        except (TypeError, AttributeError):
+            try:
+                reset_result = env.reset(seed=ep_seed)
+            except TypeError:
+                if hasattr(env, 'seed'):
+                    env.seed(ep_seed)  # gym 0.23 등 reset(seed=) 미지원 시
+                reset_result = env.reset()
+        
+        obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+        done = False
         total_reward = 0.0
         while not done:
             action = np.asarray(jax.device_get(action_fn(params, obs)))
-            obs, reward, done, _ = env.step(action)
+            step_out = env.step(action)
+            if len(step_out) == 5:
+                obs, reward, terminated, truncated, _ = step_out
+                done = terminated or truncated
+            else:
+                obs, reward, done, _ = step_out
             total_reward += reward
         returns.append(total_reward)
 
@@ -465,7 +496,7 @@ def update_actor(
     new_actor = actor.apply_gradients(grads=grads)
 
     new_actor = new_actor.replace(
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau)
+        target_params=optax.incremental_update(new_actor.params, actor.target_params, tau)
     )
     new_critic = critic.replace(
         target_params=optax.incremental_update(critic.params, critic.target_params, tau)
@@ -481,7 +512,7 @@ def update_critic(
     batch: Dict[str, jax.Array],
     gamma: float,
     beta: float,
-    tau: float,
+    tau: float,  # 인터페이스 일관성을 위해 포함되지만 이 함수에서는 사용하지 않음 (target network는 update_actor에서 업데이트)
     policy_noise: float,
     noise_clip: float,
     metrics: Metrics,
@@ -562,7 +593,6 @@ def update_td3_no_targets(
     batch: Dict[str, Any],
     gamma: float,
     metrics: Metrics,
-    actor_bc_coef: float,
     critic_bc_coef: float,
     tau: float,
     policy_noise: float,
@@ -599,6 +629,7 @@ def main(config: Config):
 
     wandb.init(
         config=dict_config,
+        entity=config.entity,
         project=config.project,
         group=config.group,
         name=config.name,
@@ -658,88 +689,77 @@ def main(config: Config):
     update_td3_no_targets_partial = partial(
         update_td3_no_targets,
         gamma=config.gamma,
-        actor_bc_coef=config.actor_bc_coef,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
     )
 
-    def td3_loop_update_step(i: int, carry: TrainState):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
 
-        full_update = partial(
-            update_td3_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
-        )
-
-        update = partial(
-            update_td3_no_targets_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
-        )
-
-        key, new_actor, new_critic, new_metrics = jax.lax.cond(
-            update_carry["delayed_updates"][i], full_update, update
-        )
-
-        carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
-        return carry
-
-    # metrics
+    # metrics (batch_entropy 제거: 실제로 업데이트되지 않음)
     bc_metrics_to_log = [
         "critic_loss",
         "q_min",
         "actor_loss",
-        "batch_entropy",
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
     ]
-    # shared carry for update loops
-    update_carry = {
-        "key": key,
-        "actor": actor,
-        "critic": critic,
-        "buffer": buffer,
-        "delayed_updates": jax.numpy.equal(
-            jax.numpy.arange(config.num_updates_on_epoch) % config.policy_freq, 0
-        ).astype(int),
-    }
-
     @jax.jit
     def actor_action_fn(params: jax.Array, obs: jax.Array):
-        return actor.apply_fn(params, obs)
+        """Actor action function with shape handling"""
+        # obs를 배치로 변환 (1D -> 2D)
+        obs_batch = obs[None, :] if obs.ndim == 1 else obs
+        action_batch = actor.apply_fn(params, obs_batch)
+        return action_batch[0] if action_batch.shape[0] == 1 else action_batch
 
-    for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
+    current_key = key
+    current_actor = actor
+    current_critic = critic
+
+    for epoch in range(config.num_epochs):
         # metrics for accumulation during epoch and logging to wandb
-        # we need to reset them every epoch
-        update_carry["metrics"] = Metrics.create(bc_metrics_to_log)
+        # Python for 루프에서 누적 (JAX 친화적)
+        epoch_metrics = Metrics.create(bc_metrics_to_log)
 
-        update_carry = jax.lax.fori_loop(
-            lower=0,
-            upper=config.num_updates_on_epoch,
-            body_fun=td3_loop_update_step,
-            init_val=update_carry,
-        )
+        # Python for 루프로 변경 (buffer 접근을 JIT 밖으로)
+        for i in range(config.num_updates_on_epoch):
+            # 배치 샘플링 (Python side)
+            current_key, batch_key = jax.random.split(current_key)
+            batch = buffer.sample_batch(batch_key, batch_size=config.batch_size)
+
+            # 업데이트 (JAX side)
+            should_update_actor = (i % config.policy_freq == 0)
+            if should_update_actor:
+                current_key, current_actor, current_critic, temp_metrics = update_td3_partial(
+                    key=current_key,
+                    actor=current_actor,
+                    critic=current_critic,
+                    batch=batch,
+                    metrics=epoch_metrics,
+                )
+            else:
+                current_key, current_actor, current_critic, temp_metrics = update_td3_no_targets_partial(
+                    key=current_key,
+                    actor=current_actor,
+                    critic=current_critic,
+                    batch=batch,
+                    metrics=epoch_metrics,
+                )
+            epoch_metrics = temp_metrics
+
         # log mean over epoch for each metric
-        mean_metrics = update_carry["metrics"].compute()
+        mean_metrics = epoch_metrics.compute()
         wandb.log(
             {"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}}
         )
 
-        if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
+        # Update step 기반 평가 (오프라인 RL에서는 gradient update step 기준)
+        global_update_step = (epoch + 1) * config.num_updates_on_epoch
+        if epoch == 0 or (global_update_step % config.eval_freq == 0) or epoch == config.num_epochs - 1:
             eval_returns = evaluate(
                 eval_env,
-                update_carry["actor"].params,
+                current_actor.params,
                 actor_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,

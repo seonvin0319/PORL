@@ -2,6 +2,56 @@
 
 POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 multi-actor offline RL 알고리즘입니다.
 
+## 이론적 배경
+
+### JKO Chain과 Gradient Flow
+
+POGO Multi-Actor는 **JKO (Jordan-Kinderlehrer-Otto) Chain**을 사용하여 여러 actor를 순차적으로 학습하는 gradient flow 기반 접근법입니다. 각 actor는 gradient flow의 한 단계를 나타내며, 전체 chain은 연속적인 정책 진화를 이산적으로 근사합니다.
+
+### Multi-Actor 구조
+
+- **Actor 0 (π₀)**: 각 알고리즘의 원래 actor loss만 사용 (W2 regularization 없음)
+  - Offline RL에서는 데이터셋의 action과의 L2 distance 또는 BC loss 사용
+  - 이전 정책에 대한 제약 없이 자유롭게 학습
+  
+- **Actor i (π_i, i ≥ 1)**: 이전 actor (π_{i-1})에 대한 W2 거리로 학습
+  - Loss: `base_loss + w_i · W₂(π_i, π_{i-1})`
+  - 이전 actor라는 연속적인 분포를 reference로 하여 분포 간 거리를 측정하는 W2 거리 사용
+
+### 학습 목표
+
+각 actor는 다음 loss를 최소화합니다:
+
+$$L_i = \begin{cases}
+L_{\text{base}}(\pi_0) & \text{if } i = 0 \\
+L_{\text{base}}(\pi_i) + w_i \cdot W_2(\pi_i, \pi_{i-1}) & \text{if } i \geq 1
+\end{cases}$$
+
+여기서:
+- $L_{\text{base}}(\pi_i)$: 각 알고리즘의 원래 actor loss (예: IQL의 advantage-weighted BC, ReBRAC의 BC penalty - Q, FQL의 BC flow loss 등)
+- $W_2(\pi_i, \pi_{i-1})$: W2 거리 (Wasserstein-2 distance)
+- $w_i$: W2 거리의 가중치 (Actor1+부터 적용)
+
+### W2 Distance 계산 방법
+
+Policy 타입에 따라 적절한 거리 측정 방법을 자동으로 선택합니다:
+
+- **Both Gaussian**: Closed-form W2 사용
+  $$W_2^2(\pi_i, \pi_{i-1}) = ||\mu_i - \mu_{i-1}||^2 + ||\sigma_i - \sigma_{i-1}||^2$$
+  
+- **Both Stochastic (not Gaussian)**: Sinkhorn distance 사용
+  - 샘플 기반 optimal transport 알고리즘
+  
+- **At least one Deterministic**: L2 distance 사용
+  $$||\pi_i(s) - \pi_{i-1}(s)||^2$$
+
+### Critic 학습
+
+모든 알고리즘에서 Critic 업데이트는 **Actor0만 사용**합니다:
+- Critic은 기존 알고리즘의 원래 방식 그대로 유지
+- Multi-actor 학습은 Policy loss에서만 수행
+- 이는 각 알고리즘의 구조를 그대로 유지하면서 Actor만 확장하는 핵심 원칙입니다
+
 ## 주요 특징
 
 - **각 알고리즘의 구조를 그대로 사용**: Critic, V function, Q function 등은 각 알고리즘(IQL, CQL, TD3_BC 등)의 원래 구조 유지
@@ -38,6 +88,13 @@ POGO_sv 프로젝트를 baseline으로 하여 CORL 프로젝트에 통합한 mul
 - **W2 Distance**: L2 distance 사용
 - **속성**: `is_gaussian=False`, `is_stochastic=False`
 
+### FQLFlowPolicy (FQL 전용)
+- **구조**: `actor_bc_flow` (multi-step flow matching) + `actor_onestep_flow` (one-step policy)
+- **Actor0**: BC flow loss만 사용 (BC policy)
+- **Actor1+**: Q loss만 사용 (`-Q`, 다른 policy 타입 사용 가능)
+- **W2 Distance**: Sinkhorn distance 사용
+- **속성**: `is_gaussian=False`, `is_stochastic=True`
+
 ## 코드 구조
 
 ### 핵심 컴포넌트
@@ -72,6 +129,9 @@ JAX 버전 사용 시:
 ```bash
 pip install jax jaxlib flax optax ott-jax
 ```
+
+**참고**: JAX 버전은 OTT-JAX 라이브러리를 사용하여 Sinkhorn distance를 계산합니다. 
+OTT-JAX가 설치되어 있지 않으면 자동으로 fallback 구현을 사용합니다.
 
 ## 사용 방법
 
@@ -171,8 +231,12 @@ hidden_dim: 256
 gamma: 0.99
 tau: 5e-3
 beta: 1.0
+policy_noise: 0.2
+noise_clip: 0.5
+normalize_q: true
 
 # POGO Multi-Actor 설정
+algorithm: rebrac  # "rebrac" or "fql"
 w2_weights: [10.0, 10.0]
 num_actors: 3
 actor_configs:
@@ -184,6 +248,41 @@ actor_configs:
 sinkhorn_K: 4
 sinkhorn_blur: 0.05
 ```
+
+### JAX 버전 (FQL) 예시
+
+```yaml
+# FQL 기본 설정
+dataset_name: halfcheetah-medium-v2
+actor_learning_rate: 1e-3
+critic_learning_rate: 1e-3
+hidden_dim: 256
+gamma: 0.99
+tau: 5e-3
+
+# POGO Multi-Actor 설정
+algorithm: fql
+w2_weights: [10.0, 10.0]
+num_actors: 3
+actor_configs:
+  - type: flow        # Actor0: FQLFlowPolicy (BC policy)
+  - type: stochastic  # Actor1+: 다른 policy 타입 사용 가능
+  - type: stochastic
+
+# FQL 설정
+fql_alpha: 10.0          # Distillation loss coefficient
+fql_flow_steps: 10       # Number of flow steps for BC flow
+fql_q_agg: "mean"        # Q aggregation: "mean" or "min"
+fql_normalize_q_loss: false
+
+# Sinkhorn 설정
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+```
+
+**FQL 구조:**
+- **Actor0**: BC flow loss만 (BC policy)
+- **Actor1+**: Q loss만 (`-Q`, W2는 자동으로 추가됨)
 
 ## 알고리즘 구조
 
@@ -221,26 +320,24 @@ sinkhorn_blur: 0.05
 - AWAC: `mean(weights · BC_loss)`
 - SAC-N/EDAC: `(α·log_π - Q_min)`
 - ReBRAC: `(β·BC_penalty - λ·Q)`
+- FQL: `BC_flow_loss` (BC policy)
 
 #### Actor1+ (W2 penalty 추가)
 - 각 알고리즘의 actor loss + W2 distance to previous actor
+- Loss: `base_loss + w2_weight_i * W₂(π_i, π_{i-1})`
 - W2 distance 계산:
   - **Both Gaussian**: Closed-form W2 (`||μ1-μ2||² + ||σ1-σ2||²`)
   - **Both Stochastic (not Gaussian)**: Sinkhorn distance
   - **At least one Deterministic**: L2 distance
-- Loss: `base_loss + w2_weight_i * w2_distance`
+- **FQL의 경우**: Actor1+는 `-Q` loss만 사용 (W2는 자동으로 추가됨)
 
 ## Config 파라미터 설명
 
 ### 필수 파라미터
 
-- `algorithm`: 사용할 알고리즘 선택 (PyTorch 버전, 필수)
-  - `"iql"`: IQL 구조 사용 (V function + Q function)
-  - `"td3_bc"`: TD3_BC 구조 사용 (Twin Critic)
-  - `"cql"`: CQL 구조 사용 (Conservative Q-learning)
-  - `"awac"`: AWAC 구조 사용 (Twin Critic + Advantage-weighted BC)
-  - `"sac_n"`: SAC-N 구조 사용 (Vectorized Critic ensemble)
-  - `"edac"`: EDAC 구조 사용 (Vectorized Critic ensemble + diversity loss)
+- `algorithm`: 사용할 알고리즘 선택 (필수)
+  - **PyTorch 버전**: `"iql"`, `"td3_bc"`, `"cql"`, `"awac"`, `"sac_n"`, `"edac"`
+  - **JAX 버전**: `"rebrac"`, `"fql"`
 
 ### POGO Multi-Actor 전용 파라미터
 
@@ -249,8 +346,9 @@ sinkhorn_blur: 0.05
   - `num_actors = len(w2_weights) + 1` (자동 계산)
 - `num_actors`: Actor 개수 (None이면 `len(w2_weights) + 1` 사용)
 - `actor_configs`: 각 actor의 설정 리스트
-  - `type`: `"gaussian"`, `"tanh_gaussian"`, `"stochastic"`, `"deterministic"`
+  - `type`: `"gaussian"`, `"tanh_gaussian"`, `"stochastic"`, `"deterministic"`, `"flow"` (FQL 전용)
   - 예: `[{"type": "gaussian"}, {"type": "tanh_gaussian"}, {"type": "stochastic"}]`
+  - **FQL의 경우**: Actor0는 반드시 `"flow"` 타입이어야 함, Actor1+는 다른 타입 사용 가능
 - `sinkhorn_K`: Sinkhorn 계산 시 각 state당 샘플 수
 - `sinkhorn_blur`: Sinkhorn regularization parameter (epsilon)
 - `sinkhorn_backend`: Sinkhorn backend (`"tensorized"`, `"online"`, `"auto"`)
@@ -266,6 +364,7 @@ sinkhorn_blur: 0.05
 - **SAC-N**: `num_critics`, `alpha_learning_rate`, `actor_lr`
 - **EDAC**: `num_critics`, `eta`, `alpha_learning_rate`, `actor_lr`
 - **ReBRAC (JAX)**: `actor_learning_rate`, `critic_learning_rate`, `beta`, `gamma`, `tau`, `policy_noise`, `noise_clip`, `normalize_q`
+- **FQL (JAX)**: `fql_alpha`, `fql_flow_steps`, `fql_q_agg`, `fql_normalize_q_loss`
 
 ## 평가
 
@@ -287,6 +386,8 @@ algorithms/offline/
 ├── sac_n.py                    # SAC-N (그대로 사용)
 ├── edac.py                     # EDAC (그대로 사용)
 ├── rebrac.py                   # ReBRAC (JAX, 그대로 사용)
+├── fql.py                      # FQL Algorithm (JAX, POGO Multi-Actor 통합)
+├── pogo_policies_jax.py        # JAX policies (GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP, FQLFlowPolicy)
 ├── POGO_MULTI_README.md        # 이 파일
 └── POGO_MULTI_ARCHITECTURE.md  # 아키텍처 상세 설명
 

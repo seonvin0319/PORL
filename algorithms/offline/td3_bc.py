@@ -16,6 +16,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+from .networks import DeterministicMLP, build_mlp
+from .utils_pytorch import (
+    ReplayBuffer,
+    set_seed,
+    wandb_init,
+    eval_actor,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+)
 
 TensorBatch = List[torch.Tensor]
 
@@ -92,110 +102,6 @@ def wrap_env(
     return env
 
 
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    # Loads data in d4rl format, i.e. from Dict[str, np.array].
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -222,44 +128,21 @@ def modify_reward(dataset, env_name, max_episode_steps=1000):
         dataset["rewards"] -= 1.0
 
 
-class Actor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, max_action: float):
-        super(Actor, self).__init__()
+# Actor는 pogo_policies.py의 DeterministicMLP로 통합됨
+Actor = DeterministicMLP
 
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_dim),
-            nn.Tanh(),
-        )
 
-        self.max_action = max_action
-
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        return self.max_action * self.net(state)
-
-    @torch.no_grad()
-    def act(self, state: np.ndarray, device: str = "cpu") -> np.ndarray:
-        state = torch.tensor(state.reshape(1, -1), device=device, dtype=torch.float32)
-        return self(state).cpu().data.numpy().flatten()
 
 
 class Critic(nn.Module):
+    """Critic network for TD3_BC (networks.py의 build_mlp 사용)"""
     def __init__(self, state_dim: int, action_dim: int):
-        super(Critic, self).__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        super().__init__()
+        layers = build_mlp(state_dim + action_dim, hidden_dim=256, n_hiddens=3)
+        self.net = nn.Sequential(*layers)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        sa = torch.cat([state, action], 1)
+        sa = torch.cat([state, action], dim=-1)
         return self.net(sa)
 
 
@@ -303,61 +186,53 @@ class TD3_BC:
         self.device = device
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
+        """기존 TD3_BC 학습 메서드 (단일 actor용)"""
         log_dict = {}
-        self.total_it += 1
-
         state, action, reward, next_state, done = batch
-        not_done = 1 - done
-
+        not_done = 1.0 - done
+        
+        # Critic 업데이트
         with torch.no_grad():
-            # Select action according to actor and add clipped noise
             noise = (torch.randn_like(action) * self.policy_noise).clamp(
                 -self.noise_clip, self.noise_clip
             )
-
-            next_action = (self.actor_target(next_state) + noise).clamp(
+            next_action = (self.actor_target.deterministic_actions(next_state) + noise).clamp(
                 -self.max_action, self.max_action
             )
-
-            # Compute the target Q value
             target_q1 = self.critic_1_target(next_state, next_action)
             target_q2 = self.critic_2_target(next_state, next_action)
-            target_q = torch.min(target_q1, target_q2)
-            target_q = reward + not_done * self.discount * target_q
-
-        # Get current Q estimates
+            target_q = reward + not_done * self.discount * torch.min(target_q1, target_q2)
+        
         current_q1 = self.critic_1(state, action)
         current_q2 = self.critic_2(state, action)
-
-        # Compute critic loss
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-        log_dict["critic_loss"] = critic_loss.item()
-        # Optimize the critic
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_1_optimizer.step()
         self.critic_2_optimizer.step()
-
-        # Delayed actor updates
+        log_dict["critic_loss"] = float(critic_loss.item())
+        
+        # Actor 업데이트 (policy_freq마다)
         if self.total_it % self.policy_freq == 0:
-            # Compute actor loss
-            pi = self.actor(state)
+            pi = self.actor.deterministic_actions(state)
             q = self.critic_1(state, pi)
             lmbda = self.alpha / q.abs().mean().detach()
-
-            actor_loss = -lmbda * q.mean() + F.mse_loss(pi, action)
-            log_dict["actor_loss"] = actor_loss.item()
-            # Optimize the actor
+            actor_loss = -lmbda * q.mean() + self.alpha * ((pi - action) ** 2).mean()
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
-
-            # Update the frozen target models
-            soft_update(self.critic_1_target, self.critic_1, self.tau)
-            soft_update(self.critic_2_target, self.critic_2, self.tau)
-            soft_update(self.actor_target, self.actor, self.tau)
-
+            log_dict["actor_loss"] = float(actor_loss.item())
+            
+            # Target network 업데이트
+            for p, tp in zip(self.actor.parameters(), self.actor_target.parameters()):
+                tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+            for p, tp in zip(self.critic_1.parameters(), self.critic_1_target.parameters()):
+                tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+            for p, tp in zip(self.critic_2.parameters(), self.critic_2_target.parameters()):
+                tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+        
+        self.total_it += 1
         return log_dict
 
     def state_dict(self) -> Dict[str, Any]:
@@ -508,6 +383,96 @@ def train(config: TrainConfig):
                 {"d4rl_normalized_score": normalized_eval_score},
                 step=trainer.total_it,
             )
+
+
+# ============================================================================
+# POGO Multi-Actor Interface 구현
+# ============================================================================
+
+from typing import Any, Dict, List
+
+# 순환 참조 방지를 위해 파일 끝에서 import
+from .utils_pytorch import PyTorchAlgorithmInterface
+
+
+class TD3BCAlgorithm(PyTorchAlgorithmInterface):
+    """TD3_BC 알고리즘의 POGO Multi-Actor 인터페이스 구현"""
+    def __init__(self, trainer: 'TD3_BC'):
+        self.trainer = trainer
+    
+    def update_critic(
+        self,
+        trainer: Any,
+        batch: TensorBatch,
+        log_dict: Dict[str, float],
+        **kwargs
+    ) -> Dict[str, float]:
+        """TD3_BC의 Critic 업데이트"""
+        trainer.total_it += 1
+        state, action, reward, next_state, done = batch
+        not_done = 1.0 - done
+        
+        with torch.no_grad():
+            noise = (torch.randn_like(action) * trainer.policy_noise).clamp(
+                -trainer.noise_clip, trainer.noise_clip
+            )
+            next_action = (kwargs['actor_targets'][0](next_state) + noise).clamp(
+                -trainer.max_action, trainer.max_action
+            )
+            target_q1 = trainer.critic_1_target(next_state, next_action)
+            target_q2 = trainer.critic_2_target(next_state, next_action)
+            target_q = reward + not_done * trainer.discount * torch.min(target_q1, target_q2)
+        
+        current_q1 = trainer.critic_1(state, action)
+        current_q2 = trainer.critic_2(state, action)
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        trainer.critic_1_optimizer.zero_grad()
+        trainer.critic_2_optimizer.zero_grad()
+        critic_loss.backward()
+        trainer.critic_1_optimizer.step()
+        trainer.critic_2_optimizer.step()
+        log_dict["critic_loss"] = float(critic_loss.item())
+        return log_dict
+    
+    def compute_actor_loss(
+        self,
+        trainer: Any,
+        actor: nn.Module,
+        batch: TensorBatch,
+        actor_idx: int,
+        actor_is_stochastic: bool,
+        seed_base: int,
+        **kwargs
+    ) -> torch.Tensor:
+        """TD3_BC actor loss 계산"""
+        state, action, reward, next_state, done = batch
+        pi_i = actor.deterministic_actions(state)
+        q = trainer.critic_1(state, pi_i)
+        lmbda = trainer.alpha / q.abs().mean().detach()
+        
+        if actor_idx == 0:
+            # Actor0: TD3_BC loss
+            return -lmbda * q.mean() + trainer.alpha * ((pi_i - action) ** 2).mean()
+        else:
+            # Actor1+: Q 기반 loss만 (W2는 외부에서 추가)
+            return -lmbda * q.mean()
+    
+    def update_target_networks(
+        self,
+        trainer: Any,
+        actors: List[nn.Module],
+        actor_targets: List[nn.Module],
+        tau: float,
+        **kwargs
+    ) -> None:
+        """TD3_BC target network 업데이트"""
+        for actor, actor_target in zip(actors, actor_targets):
+            for p, tp in zip(actor.parameters(), actor_target.parameters()):
+                tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
+        for p, tp in zip(trainer.critic_1.parameters(), trainer.critic_1_target.parameters()):
+            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
+        for p, tp in zip(trainer.critic_2.parameters(), trainer.critic_2_target.parameters()):
+            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
 
 
 if __name__ == "__main__":

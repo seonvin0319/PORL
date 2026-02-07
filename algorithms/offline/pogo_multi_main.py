@@ -19,38 +19,44 @@ import pyrallis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# wandb removed - no longer used
+import wandb
 from geomloss import SamplesLoss
 
 # 각 알고리즘 import
-from .iql import ImplicitQLearning, TwinQ, ValueFunction, GaussianPolicy, DeterministicPolicy
-from .td3_bc import TD3_BC, Actor, Critic
-from .cql import ContinuousCQL, TanhGaussianPolicy, FullyConnectedQFunction, Scalar
+from .iql import ImplicitQLearning, TwinQ, ValueFunction
+from .td3_bc import TD3_BC, Critic
+from .networks import (
+    DeterministicMLP,
+    DeterministicMLP as Actor,
+    TanhGaussianMLP as TanhGaussianPolicy,
+    BaseActor,
+    StochasticMLP,
+    GaussianMLP,
+    TanhGaussianMLP,
+    build_mlp,
+)
+from .cql import ContinuousCQL, FullyConnectedQFunction, Scalar
 from .awac import AdvantageWeightedActorCritic, soft_update
-from .sac_n import SACN, Actor as SACNActor, VectorizedCritic
+from .sac_n import SACN, VectorizedCritic
 from .edac import EDAC
-from .pogo_policies import BaseActor, DeterministicMLP, StochasticMLP, GaussianMLP, TanhGaussianMLP
+# SAC-N/EDAC Actor는 각 파일에서 TanhGaussianMLP를 사용하도록 통합됨
 
 TensorBatch = List[torch.Tensor]
 
 
-@dataclass
-class ActorConfig:
-    """Actor 설정을 그룹화하는 dataclass (PyTorch 버전)
-    JAX 버전과 일관성을 유지하기 위해 동일한 구조 사용
-    """
-    actor: nn.Module
-    is_stochastic: bool
-    is_gaussian: bool
-    
-    @classmethod
-    def from_actor(cls, actor: nn.Module) -> 'ActorConfig':
-        """Actor 객체로부터 ActorConfig 생성"""
-        return cls(
-            actor=actor,
-            is_stochastic=getattr(actor, 'is_stochastic', False),
-            is_gaussian=getattr(actor, 'is_gaussian', False),
-        )
+# PyTorchAlgorithmInterface와 관련 클래스들은 utils_pytorch.py로 이동
+from .utils_pytorch import (
+    PyTorchAlgorithmInterface,
+    ActorConfig,
+)
+
+# 각 알고리즘의 인터페이스 구현은 각 알고리즘 파일에서 직접 import (순환 참조 방지)
+from .iql import IQLAlgorithm
+from .td3_bc import TD3BCAlgorithm
+from .cql import CQLAlgorithm
+from .awac import AWACAlgorithm
+from .sac_n import SACNAlgorithm
+from .edac import EDACAlgorithm
 
 
 class EnsembleCritic(nn.Module):
@@ -78,41 +84,27 @@ class EnsembleCritic(nn.Module):
         ])
     
     def _make_critic(self, state_dim, action_dim, hidden_dim, layernorm, n_hiddens):
-        """Create a single critic network"""
-        layers = []
-        # First layer
-        layers.append(nn.Linear(state_dim + action_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        if layernorm:
-            layers.append(nn.LayerNorm(hidden_dim))
-        
-        # Hidden layers
-        for _ in range(n_hiddens - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            if layernorm:
-                layers.append(nn.LayerNorm(hidden_dim))
-        
-        # Output layer
-        layers.append(nn.Linear(hidden_dim, 1))
+        """Create a single critic network using build_mlp"""
+        layers = build_mlp(
+            state_dim + action_dim, hidden_dim, n_hiddens, layernorm=layernorm
+        )
         
         # Initialize as in ReBRAC (EDAC style)
         net = nn.Sequential(*layers)
-        for i, layer in enumerate(net):
-            if isinstance(layer, nn.Linear):
-                if i == 0:
-                    # First layer: constant bias 0.1
-                    nn.init.constant_(layer.bias, 0.1)
-                    # Kaiming init for weight
-                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
-                elif i == len([l for l in net if isinstance(l, nn.Linear)]) - 1:
-                    # Last layer: uniform init [-3e-3, 3e-3]
-                    nn.init.uniform_(layer.weight, -3e-3, 3e-3)
-                    nn.init.uniform_(layer.bias, -3e-3, 3e-3)
-                else:
-                    # Hidden layers: constant bias 0.1
-                    nn.init.constant_(layer.bias, 0.1)
-                    nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+        linear_layers = [layer for layer in net if isinstance(layer, nn.Linear)]
+        for i, layer in enumerate(linear_layers):
+            if i == 0:
+                # First layer: constant bias 0.1
+                nn.init.constant_(layer.bias, 0.1)
+                nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+            elif i == len(linear_layers) - 1:
+                # Last layer: uniform init [-3e-3, 3e-3]
+                nn.init.uniform_(layer.weight, -3e-3, 3e-3)
+                nn.init.uniform_(layer.bias, -3e-3, 3e-3)
+            else:
+                # Hidden layers: constant bias 0.1
+                nn.init.constant_(layer.bias, 0.1)
+                nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
         
         return net
     
@@ -200,9 +192,16 @@ class TrainConfig:
     normalize_reward: bool = False
 
     # Wandb
-    project: str = "CORL"
+    entity: str = "seonvin0319"
+    project: str = "PORL"
     group: str = "POGO-Multi"
     name: str = "POGO-Multi"
+    use_wandb: bool = True
+    
+    # Logging / checkpoint
+    log_interval: int = 1  # train log 주기 (env-step 기준)
+    checkpoint_freq: int = int(5e5)  # 500k
+    save_train_logs: bool = True
 
     def __post_init__(self):
         if self.num_actors is None:
@@ -214,7 +213,21 @@ class TrainConfig:
             w = self.w2_weights[-1] if self.w2_weights else 10.0
             self.w2_weights = self.w2_weights + [w] * (expected_len - len(self.w2_weights))
         self.w2_weights = self.w2_weights[:expected_len]
-        self.name = f"{self.name}-{self.algorithm}-{self.env}-{str(uuid.uuid4())[:8]}"
+        # wandb 이름: 환경-알고리즘-seed{seed}-w{} (JAX 버전과 동일한 형식)
+        # 정수면 소수점 제거, 같은 값이면 하나만 표시
+        if len(self.w2_weights) > 0:
+            # 모든 값이 같은지 확인
+            if len(set(self.w2_weights)) == 1:
+                # 같은 값이면 하나만 사용
+                w = self.w2_weights[0]
+                # 정수면 소수점 제거
+                w2_str = str(int(w)) if w == int(w) else str(w)
+            else:
+                # 다른 값이면 모두 표시하되 정수면 소수점 제거
+                w2_str = "_".join([str(int(w)) if w == int(w) else str(w) for w in self.w2_weights])
+        else:
+            w2_str = "10"
+        self.name = f"{self.env}-{self.algorithm}-seed{self.seed}-w{w2_str}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
@@ -269,7 +282,9 @@ def _create_multi_actors(
             actor = GaussianMLP(state_dim, action_dim, max_action).to(device)
         elif actor_type == "tanh_gaussian":
             # TanhGaussian: unbounded Gaussian에서 샘플링 후 tanh 적용
-            actor = TanhGaussianMLP(state_dim, action_dim, max_action).to(device)
+            # CQL과 동일한 구조를 위해 3개의 hidden layer 사용 (기본값은 2)
+            n_hiddens = config.get("n_hiddens", 3) if isinstance(config, dict) else getattr(config, "n_hiddens", 3)
+            actor = TanhGaussianMLP(state_dim, action_dim, max_action, hidden_dim=256, n_hiddens=n_hiddens).to(device)
         elif actor_type == "deterministic":
             actor = DeterministicMLP(state_dim, action_dim, max_action).to(device)
         else:  # stochastic
@@ -400,704 +415,198 @@ def _compute_actor_loss_with_w2(
     return base_loss + w2_weight * w2_distance, w2_distance
 
 
-def _train_iql_multi_actor_gaussian(
-    trainer: ImplicitQLearning,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_gaussian: List[bool],
-    w2_weights: List[float],
+# ============================================================================
+# 통합된 Multi-Actor 업데이트 함수
+# ============================================================================
+# ============================================================================
+# 통합된 Multi-Actor 업데이트 함수
+# ============================================================================
+
+def _update_single_actor_pytorch(
+    actor: nn.Module,
+    actor_target: nn.Module,
+    actor_optimizer: torch.optim.Optimizer,
+    actor_config: ActorConfig,
+    ref_actor: Optional[nn.Module],
+    ref_actor_config: Optional[ActorConfig],
+    w2_weight: Optional[float],
     batch: TensorBatch,
-    seed_base: int,
-) -> Dict[str, float]:
-    """IQL trainer에 multi-actor 적용 (Gaussian policy용 - closed form W2)"""
-    trainer.total_it += 1
-    observations, actions, rewards, next_observations, dones = batch
-    log_dict = {}
-
-    # Base IQL의 V, Q 업데이트
-    with torch.no_grad():
-        next_v = trainer.vf(next_observations)
-    adv = trainer._update_v(observations, actions, log_dict)
-    rewards = rewards.squeeze(dim=-1)
-    dones = dones.squeeze(dim=-1)
-    trainer._update_q(next_v, observations, actions, rewards, dones, log_dict)
-
-    # Multi-actor 업데이트
-    exp_adv = torch.exp(trainer.beta * adv.detach()).clamp(max=100.0)
-
-    for i in range(len(actors)):
-        actor_i = actors[i]
-
-        # Base loss 계산 함수 (클로저로 i와 exp_adv 캡처)
-        def base_loss_fn(actor):
-            mean_i, _ = actor.get_mean_std(observations)
-            if i == 0:
-                # Actor0: IQL BC loss
-                bc_losses = torch.sum((mean_i - actions) ** 2, dim=1)
-                return torch.mean(exp_adv * bc_losses)
-            else:
-                # Actor1+: Q 기반 loss
-                Q_i = trainer.qf(observations, mean_i)
-                return -Q_i.mean()
-
-        # W2 distance 계산 (ActorConfig 사용)
-        actor_i_config = ActorConfig.from_actor(actor_i)
-        ref_actor_config = ActorConfig.from_actor(actors[i - 1]) if i > 0 else None
-        w2_weight_i = w2_weights[i - 1] if i > 0 else 0.0
-        
-        actor_loss_i, w2_i = _compute_actor_loss_with_w2(
-            base_loss_fn=base_loss_fn,
-            actor_i_config=actor_i_config,
-            ref_actor_config=ref_actor_config,
-            states=observations,
-            w2_weight=w2_weight_i,
-            sinkhorn_K=4,  # Gaussian이므로 사용 안 됨
-            sinkhorn_blur=0.05,
-            sinkhorn_loss=None,
-            seed=seed_base + 100 + i,
-        )
-
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
-
-        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0 and w2_i is not None:
-            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-
-    # Target update
-    for actor, actor_target in zip(actors, actor_targets):
-        for p, tp in zip(actor.parameters(), actor_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-
-    return log_dict
-
-
-def _train_iql_multi_actor_stochastic(
-    trainer: ImplicitQLearning,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
+    algorithm: PyTorchAlgorithmInterface,
+    actor_idx: int,
+    actor_is_stochastic: bool,
     sinkhorn_K: int,
     sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
     sinkhorn_loss,
     seed_base: int,
-) -> Dict[str, float]:
-    """IQL trainer에 multi-actor 적용 (Stochastic policy용 - Sinkhorn)"""
-    trainer.total_it += 1
-    observations, actions, rewards, next_observations, dones = batch
-    log_dict = {}
-
-    # Base IQL의 V, Q 업데이트
-    with torch.no_grad():
-        next_v = trainer.vf(next_observations)
-    adv = trainer._update_v(observations, actions, log_dict)
-    rewards = rewards.squeeze(dim=-1)
-    dones = dones.squeeze(dim=-1)
-    trainer._update_q(next_v, observations, actions, rewards, dones, log_dict)
-
-    # Multi-actor 업데이트
-    exp_adv = torch.exp(trainer.beta * adv.detach()).clamp(max=100.0)
-
-    for i in range(len(actors)):
-        actor_i = actors[i]
-
-        # Base loss 계산 함수
-        def base_loss_fn(actor):
-            if hasattr(actor, 'forward') and not actor_is_stochastic[i]:
-                pi_i = actor.forward(observations)
-            else:
-                pi_i = actor.sample_actions(observations, K=1, seed=seed_base + i)[:, 0, :]
-            
-            if i == 0:
-                # Actor0: IQL BC loss
-                bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
-                return torch.mean(exp_adv * bc_losses)
-            else:
-                # Actor1+: Q 기반 loss
-                Q_i = trainer.qf(observations, pi_i)
-                return -Q_i.mean()
-
-        # W2 distance 계산 (ActorConfig 사용)
-        actor_i_config = ActorConfig.from_actor(actor_i)
-        ref_actor_config = ActorConfig.from_actor(actors[i - 1]) if i > 0 else None
-        w2_weight_i = w2_weights[i - 1] if i > 0 else 0.0
-        
-        actor_loss_i, w2_i = _compute_actor_loss_with_w2(
-            base_loss_fn=base_loss_fn,
-            actor_i_config=actor_i_config,
+    tau: float,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """
+    단일 actor 업데이트 헬퍼 함수 (JAX 버전의 _update_single_actor와 유사)
+    
+    Args:
+        actor: 현재 actor network
+        actor_target: 현재 actor target network
+        actor_optimizer: 현재 actor optimizer
+        actor_config: 현재 actor config
+        ref_actor: 참조 actor network (Actor1+인 경우)
+        ref_actor_config: 참조 actor config (Actor1+인 경우)
+        w2_weight: W2 distance 가중치 (Actor1+인 경우)
+        batch: 배치 데이터
+        algorithm: 알고리즘 인터페이스
+        actor_idx: Actor 인덱스
+        actor_is_stochastic: Actor가 stochastic인지 여부
+        sinkhorn_K: Sinkhorn 샘플 수
+        sinkhorn_blur: Sinkhorn regularization
+        sinkhorn_loss: Sinkhorn loss 객체
+        seed_base: 랜덤 시드 베이스
+        tau: Target network 업데이트 계수
+    
+    Returns:
+        actor_loss: 계산된 loss
+        w2_distance: W2 distance (Actor0인 경우 None)
+    """
+    # Base actor loss 계산
+    base_loss = algorithm.compute_actor_loss(
+        algorithm.trainer,
+        actor,
+        batch,
+        actor_idx=actor_idx,
+        actor_is_stochastic=actor_is_stochastic,
+        seed_base=seed_base,
+    )
+    
+    if actor_idx == 0:
+        # Actor0: Base loss만 사용 (W2 penalty 없음)
+        actor_loss = base_loss
+        w2_distance = None
+    else:
+        # Actor1+: Base loss + W2 distance
+        w2_distance = _compute_w2_distance(
+            actor_i_config=actor_config,
             ref_actor_config=ref_actor_config,
-            states=observations,
-            w2_weight=w2_weight_i,
+            states=batch[0],  # observations
             sinkhorn_K=sinkhorn_K,
             sinkhorn_blur=sinkhorn_blur,
             sinkhorn_loss=sinkhorn_loss,
-            seed=seed_base + 100 + i,
+            seed=seed_base + 100 + actor_idx,
         )
+        actor_loss = base_loss + w2_weight * w2_distance
+    
+    # Actor 업데이트
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    actor_optimizer.step()
+    
+    # Target network 업데이트
+    for p, tp in zip(actor.parameters(), actor_target.parameters()):
+        tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
+    
+    return actor_loss, w2_distance
 
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
 
+def update_multi_actor_pytorch(
+    trainer: Any,
+    actors: List[nn.Module],
+    actor_targets: List[nn.Module],
+    actor_optimizers: List[torch.optim.Optimizer],
+    actor_is_stochastic: List[bool],
+    actor_is_gaussian: List[bool],
+    w2_weights: List[float],
+    batch: TensorBatch,
+    algorithm: PyTorchAlgorithmInterface,
+    sinkhorn_K: int,
+    sinkhorn_blur: float,
+    sinkhorn_backend: str,
+    sinkhorn_loss,
+    seed_base: int,
+    tau: float,
+) -> Dict[str, float]:
+    """
+    통합된 multi-actor 업데이트 함수 (JAX 버전의 update_multi_actor와 유사)
+    
+    Args:
+        trainer: Base trainer 객체
+        actors: Actor networks
+        actor_targets: Target actor networks
+        actor_optimizers: Actor optimizers
+        actor_is_stochastic: Actor stochastic 여부 리스트
+        actor_is_gaussian: Actor gaussian 여부 리스트
+        w2_weights: W2 distance 가중치 리스트 (Actor1+용)
+        batch: 배치 데이터
+        algorithm: 알고리즘 인터페이스
+        sinkhorn_K: Sinkhorn 샘플 수
+        sinkhorn_blur: Sinkhorn regularization
+        sinkhorn_backend: Sinkhorn backend
+        sinkhorn_loss: Sinkhorn loss 객체
+        seed_base: 랜덤 시드 베이스
+        tau: Target network 업데이트 계수
+    
+    Returns:
+        log_dict: 로깅용 딕셔너리
+    """
+    log_dict = {}
+    
+    # Critic/V/Q 업데이트 (AlgorithmInterface 사용)
+    log_dict = algorithm.update_critic(
+        trainer,
+        batch,
+        log_dict,
+        actors=actors,
+        actor_targets=actor_targets,
+    )
+    
+    # Multi-actor 업데이트
+    num_actors = len(actors)
+    for i in range(num_actors):
+        actor_i = actors[i]
+        actor_target_i = actor_targets[i]
+        actor_optimizer_i = actor_optimizers[i]
+        
+        # ActorConfig 생성
+        actor_config_i = ActorConfig.from_actor(actor_i)
+        
+        # 참조 actor 설정 (Actor1+인 경우)
+        if i == 0:
+            ref_actor = None
+            ref_actor_config = None
+            w2_weight_i = None
+        else:
+            ref_actor = actors[i - 1]
+            ref_actor_config = ActorConfig.from_actor(ref_actor)
+            w2_weight_i = w2_weights[i - 1]
+        
+        # 단일 actor 업데이트
+        actor_loss_i, w2_i = _update_single_actor_pytorch(
+            actor=actor_i,
+            actor_target=actor_target_i,
+            actor_optimizer=actor_optimizer_i,
+            actor_config=actor_config_i,
+            ref_actor=ref_actor,
+            ref_actor_config=ref_actor_config,
+            w2_weight=w2_weight_i,
+            batch=batch,
+            algorithm=algorithm,
+            actor_idx=i,
+            actor_is_stochastic=actor_is_stochastic[i],
+            sinkhorn_K=sinkhorn_K,
+            sinkhorn_blur=sinkhorn_blur,
+            sinkhorn_loss=sinkhorn_loss,
+            seed_base=seed_base,
+            tau=tau,
+        )
+        
         log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
         if i > 0 and w2_i is not None:
             log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-
-    # Target update
-    for actor, actor_target in zip(actors, actor_targets):
-        for p, tp in zip(actor.parameters(), actor_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-
-    return log_dict
-
-
-def _train_cql_multi_actor(
-    trainer: ContinuousCQL,
-    cql_actor: nn.Module,  # CQL의 원래 TanhGaussianPolicy (Q loss 계산용)
-    actors: List[nn.Module],  # POGO multi-actors
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
-    sinkhorn_loss,
-    seed_base: int,
-) -> Dict[str, float]:
-    """CQL trainer에 multi-actor 적용 - CQL의 원래 Q loss 그대로 사용"""
-    trainer.total_it += 1
-    observations, actions, rewards, next_observations, dones = batch
-    log_dict = {}
-
-    # Base CQL의 Q loss 계산 (CQL 구조 그대로 - 원래 _q_loss 메서드 사용)
-    # CQL의 _q_loss는 TanhGaussianPolicy의 repeat 파라미터가 필요하므로,
-    # trainer.actor는 원래 TanhGaussianPolicy를 사용
-    new_actions, log_pi = cql_actor(observations)
-    alpha, alpha_loss = trainer._alpha_and_alpha_loss(observations, log_pi)
     
-    # CQL의 원래 _q_loss 메서드 호출 (그대로 사용)
-    qf_loss, alpha_prime, alpha_prime_loss = trainer._q_loss(
-        observations, actions, next_observations, rewards, dones, alpha, log_dict
+    # 추가 target network 업데이트 (알고리즘별)
+    algorithm.update_target_networks(
+        trainer,
+        actors,
+        actor_targets,
+        tau,
     )
     
-    # Q 업데이트
-    trainer.critic_1_optimizer.zero_grad()
-    trainer.critic_2_optimizer.zero_grad()
-    qf_loss.backward(retain_graph=True)
-    trainer.critic_1_optimizer.step()
-    trainer.critic_2_optimizer.step()
-    
-    # Alpha 업데이트
-    if trainer.use_automatic_entropy_tuning:
-        trainer.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        trainer.alpha_optimizer.step()
-
-    # Multi-actor 업데이트 (POGO policies 사용)
-    for i in range(len(actors)):
-        actor_i = actors[i]
-        
-        # POGO policies 사용
-        new_actions_i = actor_i.deterministic_actions(observations)
-        log_pi_i = torch.zeros(observations.size(0), device=observations.device)
-        alpha_i, _ = trainer._alpha_and_alpha_loss(observations, log_pi_i)
-        
-        if i == 0:
-            # Actor0: CQL policy loss만 사용 (W2 penalty 없음)
-            # CQL policy loss: alpha * log_pi - Q (BC steps 후)
-            if trainer.total_it <= trainer.bc_steps:
-                # BC 단계: log_prob 대신 L2 사용
-                bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
-                actor_loss_i = (alpha_i * log_pi_i.mean() - bc_loss).mean()
-            else:
-                q_new = torch.min(
-                    trainer.critic_1(observations, new_actions_i),
-                    trainer.critic_2(observations, new_actions_i)
-                )
-                actor_loss_i = (alpha_i * log_pi_i.mean() - q_new).mean()
-        else:
-            # Actor1+: Sinkhorn to previous actor
-            ref_actor = actors[i - 1]
-            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
-            is_i_stoch = actor_is_stochastic[i]
-            is_ref_stoch = actor_is_stochastic[i - 1]
-            
-            if is_i_stoch and is_ref_stoch:
-                w2_i = _per_state_sinkhorn(
-                    actor_i, ref_actor, observations,
-                    K=sinkhorn_K, blur=sinkhorn_blur,
-                    sinkhorn_loss=sinkhorn_loss,
-                    seed=seed_base + 100 + i,
-                )
-            else:
-                with torch.no_grad():
-                    ref_action = ref_actor.deterministic_actions(observations)
-                w2_i = ((new_actions_i - ref_action) ** 2).mean()
-            
-            # CQL policy loss + Sinkhorn
-            if trainer.total_it <= trainer.bc_steps:
-                bc_loss = ((new_actions_i - actions) ** 2).sum(dim=1).mean()
-                policy_loss_base = (alpha_i * log_pi_i.mean() - bc_loss).mean()
-            else:
-                q_new = torch.min(
-                    trainer.critic_1(observations, new_actions_i),
-                    trainer.critic_2(observations, new_actions_i)
-                )
-                policy_loss_base = (alpha_i * log_pi_i.mean() - q_new).mean()
-            actor_loss_i = policy_loss_base + w2_weight_i * w2_i
-        
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
-        
-        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0:
-            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-    
-    # Target update
-    if trainer.total_it % trainer.target_update_period == 0:
-        trainer.update_target_network(trainer.soft_target_update_rate)
-        for actor, actor_target in zip(actors, actor_targets):
-            for p, tp in zip(actor.parameters(), actor_target.parameters()):
-                tp.data.copy_(trainer.soft_target_update_rate * p.data + (1 - trainer.soft_target_update_rate) * tp.data)
-    
-    return log_dict
-
-
-def _train_awac_multi_actor(
-    trainer: AdvantageWeightedActorCritic,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
-    sinkhorn_loss,
-    seed_base: int,
-) -> Dict[str, float]:
-    """AWAC trainer에 multi-actor 적용"""
-    if not hasattr(trainer, "total_it"):
-        trainer.total_it = 0
-    trainer.total_it += 1
-    states, actions, rewards, next_states, dones = batch
-    log_dict = {}
-
-    # Base AWAC의 Critic 업데이트 (AWAC 구조 그대로)
-    trainer._actor = actors[0]  # 임시로 첫 번째 actor 연결
-    critic_loss = trainer._update_critic(states, actions, rewards, dones, next_states)
-    log_dict["critic_loss"] = critic_loss
-
-    # Multi-actor 업데이트
-    for i in range(len(actors)):
-        actor_i = actors[i]
-        
-        trainer._actor = actor_i  # 현재 actor로 교체
-        
-        if i == 0:
-            # Actor0: AWAC loss만 사용 (W2 penalty 없음)
-            # AWAC의 actor loss 계산
-            with torch.no_grad():
-                pi_action = actor_i.deterministic_actions(states)
-                v = torch.min(
-                    trainer._critic_1(states, pi_action),
-                    trainer._critic_2(states, pi_action)
-                )
-                q = torch.min(
-                    trainer._critic_1(states, actions),
-                    trainer._critic_2(states, actions)
-                )
-                adv = q - v
-                weights = torch.clamp_max(
-                    torch.exp(adv / trainer._awac_lambda), trainer._exp_adv_max
-                )
-            
-            # POGO policies는 log_prob 대신 L2 사용
-            # Gradient가 필요하므로 forward() 직접 사용
-            if hasattr(actor_i, 'forward') and not actor_is_stochastic[i]:
-                pi_i = actor_i.forward(states)
-            else:
-                # StochasticMLP: sample_actions 사용
-                pi_i = actor_i.sample_actions(states, K=1, seed=seed_base + i)[:, 0, :]
-            bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
-            actor_loss_i = torch.mean(weights * bc_losses)
-        else:
-            # Actor1+: Sinkhorn to previous actor
-            ref_actor = actors[i - 1]
-            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
-            is_i_stoch = actor_is_stochastic[i]
-            is_ref_stoch = actor_is_stochastic[i - 1]
-            
-            if is_i_stoch and is_ref_stoch:
-                w2_i = _per_state_sinkhorn(
-                    actor_i, ref_actor, states,
-                    K=sinkhorn_K, blur=sinkhorn_blur,
-                    sinkhorn_loss=sinkhorn_loss,
-                    seed=seed_base + 100 + i,
-                )
-            else:
-                with torch.no_grad():
-                    if hasattr(ref_actor, 'forward') and not is_ref_stoch:
-                        ref_action = ref_actor.forward(states)
-                    else:
-                        ref_action = ref_actor.deterministic_actions(states)
-                # Gradient가 필요한 경우 forward() 직접 사용
-                if hasattr(actor_i, 'forward') and not is_i_stoch:
-                    pi_i = actor_i.forward(states)
-                else:
-                    pi_i = actor_i.deterministic_actions(states)
-                w2_i = ((pi_i - ref_action) ** 2).mean()
-            
-            # Q 기반 loss (gradient 필요)
-            if hasattr(actor_i, 'forward') and not is_i_stoch:
-                pi_i = actor_i.forward(states)
-            else:
-                # StochasticMLP: sample_actions 사용
-                pi_i = actor_i.sample_actions(states, K=1, seed=seed_base + i)[:, 0, :]
-            Q_i = torch.min(
-                trainer._critic_1(states, pi_i),
-                trainer._critic_2(states, pi_i)
-            )
-            actor_loss_i = -Q_i.mean() + w2_weight_i * w2_i
-        
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
-        
-        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0:
-            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-    
-    # Target update
-    soft_update(trainer._target_critic_1, trainer._critic_1, trainer._tau)
-    soft_update(trainer._target_critic_2, trainer._critic_2, trainer._tau)
-    for actor, actor_target in zip(actors, actor_targets):
-        for p, tp in zip(actor.parameters(), actor_target.parameters()):
-            tp.data.copy_(trainer._tau * p.data + (1 - trainer._tau) * tp.data)
-    
-    # 첫 번째 actor를 다시 연결
-    trainer._actor = actors[0]
-    
-    return log_dict
-
-
-def _train_sac_n_multi_actor(
-    trainer: SACN,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
-    sinkhorn_loss,
-    seed_base: int,
-) -> Dict[str, float]:
-    """SAC-N trainer에 multi-actor 적용 - SAC-N의 원래 구조 그대로 사용"""
-    if not hasattr(trainer, "total_it"):
-        trainer.total_it = 0
-    trainer.total_it += 1
-    state, action, reward, next_state, done = [arr.to(trainer.device) for arr in batch]
-    log_dict = {}
-
-    # Base SAC-N의 Alpha, Critic 업데이트 (SAC-N 구조 그대로)
-    trainer.actor = actors[0]  # 임시로 첫 번째 actor 연결
-    
-    # Alpha update
-    alpha_loss = trainer._alpha_loss(state)
-    trainer.alpha_optimizer.zero_grad()
-    alpha_loss.backward()
-    trainer.alpha_optimizer.step()
-    trainer.alpha = trainer.log_alpha.exp().detach()
-    
-    # Critic update (SAC-N의 원래 _critic_loss 사용)
-    critic_loss = trainer._critic_loss(state, action, reward, next_state, done)
-    trainer.critic_optimizer.zero_grad()
-    critic_loss.backward()
-    trainer.critic_optimizer.step()
-    
-    log_dict["alpha_loss"] = float(alpha_loss.item())
-    log_dict["critic_loss"] = float(critic_loss.item())
-    log_dict["alpha"] = float(trainer.alpha.item())
-
-    # Multi-actor 업데이트 (POGO policies 사용)
-    for i in range(len(actors)):
-        actor_i = actors[i]
-        
-        trainer.actor = actor_i  # 현재 actor로 교체
-        
-        if i == 0:
-            # Actor0: SAC-N loss만 사용 (W2 penalty 없음)
-            # SAC-N의 actor loss: alpha * log_pi - Q_min
-            # POGO policies는 log_prob를 직접 제공하지 않으므로 근사
-            pi_i = actor_i.deterministic_actions(state)
-            q_value_dist = trainer.critic(state, pi_i)
-            q_value_min = q_value_dist.min(0).values
-            # log_prob 근사 (작은 값 사용)
-            log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_i = (trainer.alpha * log_pi_i - q_value_min).mean()
-        else:
-            # Actor1+: Sinkhorn to previous actor
-            ref_actor = actors[i - 1]
-            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
-            is_i_stoch = actor_is_stochastic[i]
-            is_ref_stoch = actor_is_stochastic[i - 1]
-            
-            if is_i_stoch and is_ref_stoch:
-                w2_i = _per_state_sinkhorn(
-                    actor_i, ref_actor, state,
-                    K=sinkhorn_K, blur=sinkhorn_blur,
-                    sinkhorn_loss=sinkhorn_loss,
-                    seed=seed_base + 100 + i,
-                )
-            else:
-                with torch.no_grad():
-                    ref_action = ref_actor.deterministic_actions(state)
-                pi_i = actor_i.deterministic_actions(state)
-                w2_i = ((pi_i - ref_action) ** 2).mean()
-            
-            # SAC-N loss + Sinkhorn
-            pi_i = actor_i.deterministic_actions(state)
-            q_value_dist = trainer.critic(state, pi_i)
-            q_value_min = q_value_dist.min(0).values
-            log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_base = (trainer.alpha * log_pi_i - q_value_min).mean()
-            actor_loss_i = actor_loss_base + w2_weight_i * w2_i
-        
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
-        
-        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0:
-            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-    
-    # Target update
-    soft_update(trainer.target_critic, trainer.critic, tau=trainer.tau)
-    for actor, actor_target in zip(actors, actor_targets):
-        for p, tp in zip(actor.parameters(), actor_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-    
-    # 첫 번째 actor를 다시 연결
-    trainer.actor = actors[0]
-    
-    return log_dict
-
-
-def _train_edac_multi_actor(
-    trainer: EDAC,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
-    sinkhorn_loss,
-    seed_base: int,
-) -> Dict[str, float]:
-    """EDAC trainer에 multi-actor 적용 - EDAC의 원래 구조 그대로 사용"""
-    if not hasattr(trainer, "total_it"):
-        trainer.total_it = 0
-    trainer.total_it += 1
-    state, action, reward, next_state, done = [arr.to(trainer.device) for arr in batch]
-    log_dict = {}
-
-    # Base EDAC의 Alpha, Critic 업데이트 (EDAC 구조 그대로)
-    trainer.actor = actors[0]  # 임시로 첫 번째 actor 연결
-    
-    # Alpha update
-    alpha_loss = trainer._alpha_loss(state)
-    trainer.alpha_optimizer.zero_grad()
-    alpha_loss.backward()
-    trainer.alpha_optimizer.step()
-    trainer.alpha = trainer.log_alpha.exp().detach()
-    
-    # Critic update (EDAC의 원래 _critic_loss 사용 - diversity loss 포함)
-    critic_loss = trainer._critic_loss(state, action, reward, next_state, done)
-    trainer.critic_optimizer.zero_grad()
-    critic_loss.backward()
-    trainer.critic_optimizer.step()
-    
-    log_dict["alpha_loss"] = float(alpha_loss.item())
-    log_dict["critic_loss"] = float(critic_loss.item())
-    log_dict["alpha"] = float(trainer.alpha.item())
-
-    # Multi-actor 업데이트 (POGO policies 사용)
-    for i in range(len(actors)):
-        actor_i = actors[i]
-        
-        trainer.actor = actor_i  # 현재 actor로 교체
-        
-        if i == 0:
-            # Actor0: EDAC loss만 사용 (W2 penalty 없음)
-            # EDAC의 actor loss: alpha * log_pi - Q_min
-            pi_i = actor_i.deterministic_actions(state)
-            q_value_dist = trainer.critic(state, pi_i)
-            q_value_min = q_value_dist.min(0).values
-            log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_i = (trainer.alpha * log_pi_i - q_value_min).mean()
-        else:
-            # Actor1+: Sinkhorn to previous actor
-            ref_actor = actors[i - 1]
-            w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
-            is_i_stoch = actor_is_stochastic[i]
-            is_ref_stoch = actor_is_stochastic[i - 1]
-            
-            if is_i_stoch and is_ref_stoch:
-                w2_i = _per_state_sinkhorn(
-                    actor_i, ref_actor, state,
-                    K=sinkhorn_K, blur=sinkhorn_blur,
-                    sinkhorn_loss=sinkhorn_loss,
-                    seed=seed_base + 100 + i,
-                )
-            else:
-                with torch.no_grad():
-                    ref_action = ref_actor.deterministic_actions(state)
-                pi_i = actor_i.deterministic_actions(state)
-                w2_i = ((pi_i - ref_action) ** 2).mean()
-            
-            # EDAC loss + Sinkhorn
-            pi_i = actor_i.deterministic_actions(state)
-            q_value_dist = trainer.critic(state, pi_i)
-            q_value_min = q_value_dist.min(0).values
-            log_pi_i = torch.zeros(state.size(0), device=state.device)
-            actor_loss_base = (trainer.alpha * log_pi_i - q_value_min).mean()
-            actor_loss_i = actor_loss_base + w2_weight_i * w2_i
-        
-        opt = actor_optimizers[i]
-        opt.zero_grad()
-        actor_loss_i.backward()
-        opt.step()
-        
-        log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-        if i > 0:
-            log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-    
-    # Target update
-    soft_update(trainer.target_critic, trainer.critic, tau=trainer.tau)
-    for actor, actor_target in zip(actors, actor_targets):
-        for p, tp in zip(actor.parameters(), actor_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-    
-    # 첫 번째 actor를 다시 연결
-    trainer.actor = actors[0]
-    
-    return log_dict
-
-
-def _train_td3_bc_multi_actor(
-    trainer: TD3_BC,
-    actors: List[nn.Module],
-    actor_targets: List[nn.Module],
-    actor_optimizers: List[torch.optim.Optimizer],
-    actor_is_stochastic: List[bool],
-    w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    sinkhorn_backend: str,
-    batch: TensorBatch,
-    sinkhorn_loss,
-    seed_base: int,
-) -> Dict[str, float]:
-    """TD3_BC trainer에 multi-actor 적용"""
-    trainer.total_it += 1  # Base trainer의 total_it 업데이트
-    state, action, reward, next_state, done = batch
-    not_done = 1.0 - done
-    log_dict = {}
-
-    # Critic 업데이트 (base trainer 방식)
-    with torch.no_grad():
-        noise = (torch.randn_like(action) * trainer.policy_noise).clamp(
-            -trainer.noise_clip, trainer.noise_clip
-        )
-        next_action = (actor_targets[0](next_state) + noise).clamp(
-            -trainer.max_action, trainer.max_action
-        )
-        target_q1 = trainer.critic_1_target(next_state, next_action)
-        target_q2 = trainer.critic_2_target(next_state, next_action)
-        target_q = reward + not_done * trainer.discount * torch.min(target_q1, target_q2)
-
-    current_q1 = trainer.critic_1(state, action)
-    current_q2 = trainer.critic_2(state, action)
-    critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-    trainer.critic_1_optimizer.zero_grad()
-    trainer.critic_2_optimizer.zero_grad()
-    critic_loss.backward()
-    trainer.critic_1_optimizer.step()
-    trainer.critic_2_optimizer.step()
-    log_dict["critic_loss"] = float(critic_loss.item())
-
-    # Multi-actor 업데이트 (policy_freq마다)
-    if trainer.total_it % trainer.policy_freq == 0:
-        for i in range(len(actors)):
-            actor_i = actors[i]
-
-            # POGO policies 사용
-            pi_i = actor_i.deterministic_actions(state)
-            q = trainer.critic_1(state, pi_i)
-            lmbda = trainer.alpha / q.abs().mean().detach()
-
-            if i == 0:
-                # Actor0: TD3_BC loss만 사용 (W2 penalty 없음)
-                actor_loss_i = -lmbda * q.mean() + trainer.alpha * ((pi_i - action) ** 2).mean()
-            else:
-                # Actor1+: Sinkhorn to previous actor
-                ref_actor = actors[i - 1]
-                w2_weight_i = w2_weights[i - 1]  # w2_weights는 Actor1부터 시작
-                is_i_stoch = actor_is_stochastic[i]
-                is_ref_stoch = actor_is_stochastic[i - 1]
-
-                if is_i_stoch and is_ref_stoch:
-                    w2_i = _per_state_sinkhorn(
-                        actor_i, ref_actor, state,
-                        K=sinkhorn_K, blur=sinkhorn_blur,
-                        sinkhorn_loss=sinkhorn_loss,
-                        seed=seed_base + 100 + i,
-                    )
-                else:
-                    with torch.no_grad():
-                        ref_action = ref_actor.deterministic_actions(state)
-                    w2_i = ((pi_i - ref_action) ** 2).mean()
-
-                actor_loss_i = -lmbda * q.mean() + w2_weight_i * w2_i
-
-            opt = actor_optimizers[i]
-            opt.zero_grad()
-            actor_loss_i.backward()
-            opt.step()
-
-            log_dict[f"actor_{i}_loss"] = float(actor_loss_i.item())
-            if i > 0:
-                log_dict[f"w2_{i}_distance"] = float(w2_i.item())
-
-        # Target update
-        for actor, actor_target in zip(actors, actor_targets):
-            for p, tp in zip(actor.parameters(), actor_target.parameters()):
-                tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-        for p, tp in zip(trainer.critic_1.parameters(), trainer.critic_1_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-        for p, tp in zip(trainer.critic_2.parameters(), trainer.critic_2_target.parameters()):
-            tp.data.copy_(trainer.tau * p.data + (1 - trainer.tau) * tp.data)
-
     return log_dict
 
 
@@ -1163,8 +672,9 @@ def train(config: TrainConfig):
         config.actor_configs, config.algorithm, config.device, config.actor_lr
     )
 
-    # Base trainer 생성 (각 알고리즘별)
+    # Base trainer 생성 및 AlgorithmInterface 인스턴스 생성
     sinkhorn_loss = SamplesLoss(loss="sinkhorn", p=2, blur=config.sinkhorn_blur, backend=config.sinkhorn_backend)
+    algorithm = None
 
     if config.algorithm == "iql":
         q_network = TwinQ(state_dim, action_dim).to(config.device)
@@ -1188,21 +698,26 @@ def train(config: TrainConfig):
             device=config.device,
         )
 
-        # Gaussian과 Stochastic 구분
-        use_gaussian = any(actor_is_gaussian)
+        algorithm = IQLAlgorithm(trainer)
         
         def train_fn(batch):
             seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
-            if use_gaussian:
-                return _train_iql_multi_actor_gaussian(
-                    trainer, actors, actor_targets, actor_optimizers, actor_is_gaussian,
-                    config.w2_weights, batch, seed_base
-                )
-            else:
-                return _train_iql_multi_actor_stochastic(
-                    trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                    config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                    config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+            return update_multi_actor_pytorch(
+                trainer=trainer,
+                actors=actors,
+                actor_targets=actor_targets,
+                actor_optimizers=actor_optimizers,
+                actor_is_stochastic=actor_is_stochastic,
+                actor_is_gaussian=actor_is_gaussian,
+                w2_weights=config.w2_weights,
+                batch=batch,
+                algorithm=algorithm,
+                sinkhorn_K=config.sinkhorn_K,
+                sinkhorn_blur=config.sinkhorn_blur,
+                sinkhorn_backend=config.sinkhorn_backend,
+                sinkhorn_loss=sinkhorn_loss,
+                seed_base=seed_base,
+                tau=config.tau,
                 )
 
     elif config.algorithm == "td3_bc":
@@ -1227,14 +742,40 @@ def train(config: TrainConfig):
             alpha=config.alpha,
             device=config.device,
         )
+        
+        algorithm = TD3BCAlgorithm(trainer)
 
         def train_fn(batch):
             seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
-            return _train_td3_bc_multi_actor(
-                trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
-            )
+            # TD3_BC는 policy_freq마다만 actor 업데이트
+            if trainer.total_it % trainer.policy_freq == 0:
+                return update_multi_actor_pytorch(
+                    trainer=trainer,
+                    actors=actors,
+                    actor_targets=actor_targets,
+                    actor_optimizers=actor_optimizers,
+                    actor_is_stochastic=actor_is_stochastic,
+                    actor_is_gaussian=actor_is_gaussian,
+                    w2_weights=config.w2_weights,
+                    batch=batch,
+                    algorithm=algorithm,
+                    sinkhorn_K=config.sinkhorn_K,
+                    sinkhorn_blur=config.sinkhorn_blur,
+                    sinkhorn_backend=config.sinkhorn_backend,
+                    sinkhorn_loss=sinkhorn_loss,
+                    seed_base=seed_base,
+                    tau=config.tau,
+                )
+            else:
+                # Critic만 업데이트
+                log_dict = algorithm.update_critic(
+                    trainer,
+                    batch,
+                    {},
+                    actors=actors,
+                    actor_targets=actor_targets,
+                )
+                return log_dict
 
     elif config.algorithm == "cql":
         from .cql import Scalar, TanhGaussianPolicy
@@ -1248,10 +789,10 @@ def train(config: TrainConfig):
             target_entropy_val = -np.prod(env.action_space.shape).item()
 
         # CQL의 Q loss는 TanhGaussianPolicy의 repeat 파라미터가 필요하므로,
-        # CQL trainer에는 원래 TanhGaussianPolicy 사용
+        # CQL trainer에는 원래 TanhGaussianPolicy 사용 (3개의 hidden layer)
         cql_actor = TanhGaussianPolicy(
             state_dim, action_dim, max_action,
-            log_std_multiplier=1.0,
+            hidden_dim=256, n_hiddens=3,
             log_std_offset=-1.0,
             orthogonal_init=False,
         ).to(config.device)
@@ -1285,13 +826,27 @@ def train(config: TrainConfig):
             cql_clip_diff_max=np.inf,
             device=config.device,
         )
+        
+        algorithm = CQLAlgorithm(trainer, cql_actor)
 
         def train_fn(batch):
             seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
-            return _train_cql_multi_actor(
-                trainer, cql_actor, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+            return update_multi_actor_pytorch(
+                trainer=trainer,
+                actors=actors,
+                actor_targets=actor_targets,
+                actor_optimizers=actor_optimizers,
+                actor_is_stochastic=actor_is_stochastic,
+                actor_is_gaussian=actor_is_gaussian,
+                w2_weights=config.w2_weights,
+                batch=batch,
+                algorithm=algorithm,
+                sinkhorn_K=config.sinkhorn_K,
+                sinkhorn_blur=config.sinkhorn_blur,
+                sinkhorn_backend=config.sinkhorn_backend,
+                sinkhorn_loss=sinkhorn_loss,
+                seed_base=seed_base,
+                tau=config.tau,
             )
 
     elif config.algorithm == "awac":
@@ -1313,15 +868,30 @@ def train(config: TrainConfig):
             awac_lambda=getattr(config, "awac_lambda", 1.0),
             exp_adv_max=getattr(config, "exp_adv_max", 100.0),
         )
-
+        
+        if not hasattr(trainer, "total_it"):
+            trainer.total_it = 0
+        
+        algorithm = AWACAlgorithm(trainer)
+        
         def train_fn(batch):
-            seed_base = (config.seed if config.seed else 0) * 1000000 + getattr(trainer, "total_it", 0) * 1000
-            if not hasattr(trainer, "total_it"):
-                trainer.total_it = 0
-            return _train_awac_multi_actor(
-                trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+            seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
+            return update_multi_actor_pytorch(
+                trainer=trainer,
+                actors=actors,
+                actor_targets=actor_targets,
+                actor_optimizers=actor_optimizers,
+                actor_is_stochastic=actor_is_stochastic,
+                actor_is_gaussian=actor_is_gaussian,
+                w2_weights=config.w2_weights,
+                batch=batch,
+                algorithm=algorithm,
+                sinkhorn_K=config.sinkhorn_K,
+                sinkhorn_blur=config.sinkhorn_blur,
+                sinkhorn_backend=config.sinkhorn_backend,
+                sinkhorn_loss=sinkhorn_loss,
+                seed_base=seed_base,
+                tau=config.tau,
             )
 
     elif config.algorithm == "sac_n":
@@ -1339,15 +909,30 @@ def train(config: TrainConfig):
             alpha_learning_rate=config.alpha_learning_rate,
             device=config.device,
         )
-
+        
+        if not hasattr(trainer, "total_it"):
+            trainer.total_it = 0
+        
+        algorithm = SACNAlgorithm(trainer)
+        
         def train_fn(batch):
-            seed_base = (config.seed if config.seed else 0) * 1000000 + getattr(trainer, "total_it", 0) * 1000
-            if not hasattr(trainer, "total_it"):
-                trainer.total_it = 0
-            return _train_sac_n_multi_actor(
-                trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+            seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
+            return update_multi_actor_pytorch(
+                trainer=trainer,
+                actors=actors,
+                actor_targets=actor_targets,
+                actor_optimizers=actor_optimizers,
+                actor_is_stochastic=actor_is_stochastic,
+                actor_is_gaussian=actor_is_gaussian,
+                w2_weights=config.w2_weights,
+                batch=batch,
+                algorithm=algorithm,
+                sinkhorn_K=config.sinkhorn_K,
+                sinkhorn_blur=config.sinkhorn_blur,
+                sinkhorn_backend=config.sinkhorn_backend,
+                sinkhorn_loss=sinkhorn_loss,
+                seed_base=seed_base,
+                tau=config.tau,
             )
 
     elif config.algorithm == "edac":
@@ -1366,15 +951,30 @@ def train(config: TrainConfig):
             alpha_learning_rate=config.alpha_learning_rate,
             device=config.device,
         )
-
+        
+        if not hasattr(trainer, "total_it"):
+            trainer.total_it = 0
+        
+        algorithm = EDACAlgorithm(trainer)
+        
         def train_fn(batch):
-            seed_base = (config.seed if config.seed else 0) * 1000000 + getattr(trainer, "total_it", 0) * 1000
-            if not hasattr(trainer, "total_it"):
-                trainer.total_it = 0
-            return _train_edac_multi_actor(
-                trainer, actors, actor_targets, actor_optimizers, actor_is_stochastic,
-                config.w2_weights, config.sinkhorn_K, config.sinkhorn_blur,
-                config.sinkhorn_backend, batch, sinkhorn_loss, seed_base
+            seed_base = (config.seed if config.seed else 0) * 1000000 + trainer.total_it * 1000
+            return update_multi_actor_pytorch(
+                trainer=trainer,
+                actors=actors,
+                actor_targets=actor_targets,
+                actor_optimizers=actor_optimizers,
+                actor_is_stochastic=actor_is_stochastic,
+                actor_is_gaussian=actor_is_gaussian,
+                w2_weights=config.w2_weights,
+                batch=batch,
+                algorithm=algorithm,
+                sinkhorn_K=config.sinkhorn_K,
+                sinkhorn_blur=config.sinkhorn_blur,
+                sinkhorn_backend=config.sinkhorn_backend,
+                sinkhorn_loss=sinkhorn_loss,
+                seed_base=seed_base,
+                tau=config.tau,
             )
 
     else:
@@ -1387,19 +987,89 @@ def train(config: TrainConfig):
     print("---------------------------------------", flush=True)
 
     evaluations = {i: [] for i in range(config.num_actors)}
-    all_logs = []  # 모든 로그 저장
+    
+    # 전역 카운터
+    global_env_step = 0  # env timestep
+    global_update_step = 0  # gradient update count
+    
+    train_logs = []
+    eval_logs = []
+    last_eval_step = 0
+    
+    # wandb 초기화
+    import wandb
+    if config.use_wandb:
+        wandb.init(
+            config=asdict(config),
+            entity=config.entity,
+            project=config.project,
+            group=config.group,
+            name=config.name,
+            id=str(uuid.uuid4()),
+        )
     
     for t in range(int(config.max_timesteps)):
+        global_env_step += config.batch_size
+        global_update_step += 1
+        
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
-        log_dict = train_fn(batch)
-        log_dict["timestep"] = t + 1
-        all_logs.append(log_dict)
-
-        if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
+        train_out = train_fn(batch)
+        
+        # wandb 로깅: 학습 메트릭 (pogogo.py 형식)
+        if config.use_wandb and (global_env_step % config.log_interval == 0):
+            log_dict = {f"train/{k}": float(v) if isinstance(v, (int, float, np.floating)) else v 
+                       for k, v in train_out.items() 
+                       if k != "timestep"}
+            log_dict["train/global_step"] = global_env_step
+            wandb.log(log_dict, step=global_env_step)
+        
+        # 공통 메타 필드 부착 (파일 저장용)
+        train_log = {
+            "env_step": int(global_env_step),
+            "update_step": int(global_update_step),
+            "epoch": None,  # 필요하면 채우기
+            **{k: float(v) if isinstance(v, (int, float, np.floating)) else v 
+               for k, v in train_out.items() 
+               if k != "timestep"},
+        }
+        
+        # 내부 timestep 키 제거/통일
+        train_log.pop("timestep", None)
+        
+        # train 로그 저장/출력
+        if config.save_train_logs and (global_env_step % config.log_interval == 0):
+            train_logs.append(train_log)
+        
+        # 체크포인트
+        if global_env_step % config.checkpoint_freq == 0:
+            checkpoint_dir = os.path.join("results", config.algorithm, config.env.replace("-", "_"), f"seed_{config.seed}", "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            ckpt = {}
+            if hasattr(trainer, "critic_1"):
+                ckpt["critic_1"] = trainer.critic_1.state_dict()
+                ckpt["critic_2"] = trainer.critic_2.state_dict()
+            if hasattr(trainer, "qf"):
+                ckpt["qf"] = trainer.qf.state_dict()
+                ckpt["vf"] = trainer.vf.state_dict()
+            if hasattr(trainer, "critic"):
+                ckpt["critic"] = trainer.critic.state_dict()
             for i in range(config.num_actors):
-                # 평가는 각 actor마다
+                ckpt[f"actor_{i}"] = actors[i].state_dict()
+                if actor_targets[i] is not None:
+                    ckpt[f"actor_{i}_target"] = actor_targets[i].state_dict()
+            checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_env_step}.pt")
+            torch.save(ckpt, checkpoint_file)
+        
+        # 진행 상황 출력 (10k timestep마다)
+        if global_env_step % 10000 == 0 or global_env_step >= config.max_timesteps:
+            print(f"Env steps: {global_env_step}", flush=True)
+
+        # 평가
+        if (global_env_step - last_eval_step) >= config.eval_freq or global_env_step >= config.max_timesteps:
+            print(f"  Evaluation at step {global_env_step}:", flush=True)
+            actor_results = []
+            for i in range(config.num_actors):
                 actor_i = actors[i]
                 try:
                     env.seed(config.seed + 100 + i)
@@ -1407,11 +1077,25 @@ def train(config: TrainConfig):
                 except Exception:
                     pass
                 actor_i.eval()
-                episode_rewards = []
+                
+                # Deterministic 평가
+                episode_rewards_det = []
                 for ep in range(config.n_episodes):
-                    state, done = env.reset(), False
-                    if isinstance(state, tuple):
-                        state = state[0]
+                    ep_seed = config.seed + 100 + i * 100 + ep
+                    np.random.seed(ep_seed)
+                    try:
+                        env.action_space.seed(ep_seed)
+                        reset_result = env.reset(seed=ep_seed)
+                    except (TypeError, AttributeError):
+                        try:
+                            reset_result = env.reset(seed=ep_seed)
+                        except TypeError:
+                            if hasattr(env, 'seed'):
+                                env.seed(ep_seed)
+                            reset_result = env.reset()
+                    
+                    state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+                    done = False
                     ep_ret = 0.0
                     while not done:
                         action = actor_i.act(state, config.device)
@@ -1422,29 +1106,199 @@ def train(config: TrainConfig):
                         else:
                             state, reward, done, _ = step_out
                         ep_ret += reward
-                    episode_rewards.append(ep_ret)
-                actor_i.train()
-                scores = np.asarray(episode_rewards)
-                norm_score = env.get_normalized_score(scores.mean()) * 100.0
-                evaluations[i].append(norm_score)
-                log_dict[f"eval_actor_{i}"] = norm_score
-                print(f"  Actor {i} eval (norm): {norm_score:.1f}", flush=True)
+                    episode_rewards_det.append(ep_ret)
                 
-                # 평가 결과를 로그에 추가
-                eval_log = {
-                    "timestep": t + 1,
-                    "actor": i,
-                    "eval_score": float(norm_score),
-                    "raw_score": float(scores.mean()),
-                    "std": float(scores.std()),
+                # Stochastic 평가
+                episode_rewards_stoch = []
+                step_count = 0
+                for ep in range(config.n_episodes):
+                    ep_seed = config.seed + 10000 + i * 100 + ep
+                    np.random.seed(ep_seed)
+                    try:
+                        env.action_space.seed(ep_seed)
+                        reset_result = env.reset(seed=ep_seed)
+                    except (TypeError, AttributeError):
+                        try:
+                            reset_result = env.reset(seed=ep_seed)
+                        except TypeError:
+                            if hasattr(env, 'seed'):
+                                env.seed(ep_seed)
+                            reset_result = env.reset()
+                    
+                    state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+                    state_tensor = torch.tensor(state.reshape(1, -1), device=config.device, dtype=torch.float32)
+                    done = False
+                    ep_ret = 0.0
+                    while not done:
+                        # 재현성을 위해 episode와 step 기반 시드 사용
+                        eval_seed = (config.seed if config.seed else 0) * 10000 + ep * 1000 + step_count
+                        # sample_actions를 사용하여 stochastic action 샘플링
+                        actions = actor_i.sample_actions(state_tensor, K=1, seed=eval_seed)
+                        action = actions[0].cpu().numpy().flatten()
+                        step_out = env.step(action)
+                        if len(step_out) == 5:
+                            state, reward, terminated, truncated, _ = step_out
+                            done = terminated or truncated
+                        else:
+                            state, reward, done, _ = step_out
+                        ep_ret += reward
+                        step_count += 1
+                    episode_rewards_stoch.append(ep_ret)
+                
+                actor_i.train()
+                
+                scores_det = np.asarray(episode_rewards_det)
+                scores_stoch = np.asarray(episode_rewards_stoch)
+                norm_score_det = env.get_normalized_score(scores_det.mean()) * 100.0
+                norm_score_stoch = env.get_normalized_score(scores_stoch.mean()) * 100.0
+                
+                det_avg = float(scores_det.mean())
+                det_score = float(norm_score_det)
+                stoch_avg = float(scores_stoch.mean())
+                stoch_score = float(norm_score_stoch)
+                
+                actor_results.append({
+                    'det_avg': det_avg,
+                    'det_score': det_score,
+                    'stoch_avg': stoch_avg,
+                    'stoch_score': stoch_score
+                })
+                
+                print(f"    Actor {i} - Deterministic: {det_avg:.3f}, D4RL score: {det_score:.3f}", flush=True)
+                print(f"    Actor {i} - Stochastic: {stoch_avg:.3f}, D4RL score: {stoch_score:.3f}", flush=True)
+                
+                evaluations[i].append(det_score)
+                
+                e = {
+                    "env_step": int(global_env_step),
+                    "update_step": int(global_update_step),
+                    "actor": int(i),
+                    "det_score": det_score,
+                    "det_avg": det_avg,
+                    "stoch_score": stoch_score,
+                    "stoch_avg": stoch_avg,
                 }
-                all_logs.append(eval_log)
+                eval_logs.append(e)
+            
+            # wandb 로깅: 평가 메트릭 (pogogo.py 형식)
+            if config.use_wandb:
+                eval_log_dict = {}
+                for i in range(config.num_actors):
+                    r = actor_results[i]
+                    eval_log_dict[f"eval/actor_{i}/det_score"] = r['det_score']
+                    eval_log_dict[f"eval/actor_{i}/det_avg"] = r['det_avg']
+                    eval_log_dict[f"eval/actor_{i}/stoch_score"] = r['stoch_score']
+                    eval_log_dict[f"eval/actor_{i}/stoch_avg"] = r['stoch_avg']
+                eval_log_dict["eval/global_step"] = global_env_step
+                wandb.log(eval_log_dict, step=global_env_step)
+            
+            last_eval_step = global_env_step
 
-    # 학습 완료 후 최종 평가
+    # 학습 완료 후 최종 평가 (pogogo.py 형식)
     print("\n" + "=" * 60, flush=True)
     print("Training completed!", flush=True)
     print("=" * 60, flush=True)
+    
+    # 최종 평가: 각 actor마다 deterministic과 stochastic 평가
     for i in range(config.num_actors):
+        print(f"\n======== Final Evaluation: Actor {i} ========", flush=True)
+        actor_i = actors[i]
+        actor_i.eval()
+        
+        det_scores, stoch_scores = [], []
+        for r in range(5):  # 5 runs
+            # Deterministic 평가
+            episode_rewards_det = []
+            for ep in range(config.n_episodes):
+                ep_seed = 1000 + 100 * r + i * 1000 + ep
+                np.random.seed(ep_seed)
+                try:
+                    env.action_space.seed(ep_seed)
+                    reset_result = env.reset(seed=ep_seed)
+                except (TypeError, AttributeError):
+                    try:
+                        reset_result = env.reset(seed=ep_seed)
+                    except TypeError:
+                        if hasattr(env, 'seed'):
+                            env.seed(ep_seed)
+                        reset_result = env.reset()
+                
+                state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+                done = False
+                ep_ret = 0.0
+                while not done:
+                    action = actor_i.act(state, config.device)
+                    step_out = env.step(action)
+                    if len(step_out) == 5:
+                        state, reward, terminated, truncated, _ = step_out
+                        done = terminated or truncated
+                    else:
+                        state, reward, done, _ = step_out
+                    ep_ret += reward
+                episode_rewards_det.append(ep_ret)
+            
+            scores_det = np.asarray(episode_rewards_det)
+            norm_score_det = env.get_normalized_score(scores_det.mean()) * 100.0
+            det_scores.append(float(norm_score_det))
+            
+            # Stochastic 평가
+            episode_rewards_stoch = []
+            step_count = 0
+            for ep in range(config.n_episodes):
+                ep_seed = 2000 + 100 * r + i * 1000 + ep
+                np.random.seed(ep_seed)
+                try:
+                    env.action_space.seed(ep_seed)
+                    reset_result = env.reset(seed=ep_seed)
+                except (TypeError, AttributeError):
+                    try:
+                        reset_result = env.reset(seed=ep_seed)
+                    except TypeError:
+                        if hasattr(env, 'seed'):
+                            env.seed(ep_seed)
+                        reset_result = env.reset()
+                
+                state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+                state_tensor = torch.tensor(state.reshape(1, -1), device=config.device, dtype=torch.float32)
+                done = False
+                ep_ret = 0.0
+                while not done:
+                    eval_seed = ep_seed * 10000 + step_count
+                    # sample_actions를 사용하여 stochastic action 샘플링
+                    actions = actor_i.sample_actions(state_tensor, K=1, seed=eval_seed)
+                    action = actions[0].cpu().numpy().flatten()
+                    step_out = env.step(action)
+                    if len(step_out) == 5:
+                        state, reward, terminated, truncated, _ = step_out
+                        done = terminated or truncated
+                    else:
+                        state, reward, done, _ = step_out
+                    ep_ret += reward
+                    step_count += 1
+                episode_rewards_stoch.append(ep_ret)
+            
+            scores_stoch = np.asarray(episode_rewards_stoch)
+            norm_score_stoch = env.get_normalized_score(scores_stoch.mean()) * 100.0
+            stoch_scores.append(float(norm_score_stoch))
+        
+        actor_i.train()
+        
+        det_scores = np.array(det_scores, dtype=np.float32)
+        stoch_scores = np.array(stoch_scores, dtype=np.float32)
+        
+        print(f"[FINAL] Deterministic: mean={det_scores.mean():.3f}, std={det_scores.std():.3f} over 5x{config.n_episodes}", flush=True)
+        print(f"[FINAL] Stochastic:   mean={stoch_scores.mean():.3f}, std={stoch_scores.std():.3f} over 5x{config.n_episodes}", flush=True)
+        
+        # wandb 로깅: 최종 평가 결과 (pogogo.py 형식)
+        if config.use_wandb:
+            actor_suffix = f"_actor_{i}" if i is not None else ""
+            wandb.log({
+                f"final{actor_suffix}/det_mean": float(det_scores.mean()),
+                f"final{actor_suffix}/det_std": float(det_scores.std()),
+                f"final{actor_suffix}/stoch_mean": float(stoch_scores.mean()),
+                f"final{actor_suffix}/stoch_std": float(stoch_scores.std()),
+            })
+        
         if evaluations[i]:
             final_score = evaluations[i][-1]
             best_score = max(evaluations[i])
@@ -1453,32 +1307,74 @@ def train(config: TrainConfig):
     # 로그 저장: results/{algorithm}/{env}/seed_{seed}/logs/
     import json
     import datetime
-    env_name = config.env.replace("-", "_")  # halfcheetah-medium-v2 -> halfcheetah_medium_v2
+    
+    env_name = config.env.replace("-", "_")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     log_dir = os.path.join("results", config.algorithm, env_name, f"seed_{config.seed}", "logs")
     os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"{config.algorithm}_{env_name}_seed{config.seed}_{timestamp}.json")
     
-    # 평가 결과만 정리해서 저장
+    train_log_file = os.path.join(
+        log_dir, f"train_{config.algorithm}_{env_name}_seed{config.seed}_{timestamp}.jsonl"
+    )
+    eval_log_file = os.path.join(
+        log_dir, f"eval_{config.algorithm}_{env_name}_seed{config.seed}_{timestamp}.jsonl"
+    )
+    summary_file = os.path.join(
+        log_dir, f"summary_{config.algorithm}_{env_name}_seed{config.seed}_{timestamp}.json"
+    )
+    
+    # JSONL (line-delimited)
+    if config.save_train_logs:
+        with open(train_log_file, "w") as f:
+            for row in train_logs:
+                f.write(json.dumps(row) + "\n")
+    
+    with open(eval_log_file, "w") as f:
+        for row in eval_logs:
+            f.write(json.dumps(row) + "\n")
+    
     eval_summary = {
         "algorithm": config.algorithm,
         "env": config.env,
-        "seed": config.seed,
-        "num_actors": config.num_actors,
-        "w2_weights": config.w2_weights,
-        "max_timesteps": config.max_timesteps,
-        "evaluations": {str(i): evaluations[i] for i in range(config.num_actors)},
-        "final_scores": {str(i): evaluations[i][-1] if evaluations[i] else None for i in range(config.num_actors)},
-        "best_scores": {str(i): max(evaluations[i]) if evaluations[i] else None for i in range(config.num_actors)},
+        "seed": int(config.seed),
+        "num_actors": int(config.num_actors),
+        "w2_weights": [float(w) for w in config.w2_weights],
+        "max_timesteps": int(config.max_timesteps),
+        "log_interval": int(config.log_interval),
+        "eval_freq": int(config.eval_freq),
+        "checkpoint_freq": int(config.checkpoint_freq),
+        "final_env_step": int(global_env_step),
+        "final_update_step": int(global_update_step),
+        "evaluations": {str(i): [float(x) for x in evaluations[i]] for i in range(config.num_actors)},
+        "final_scores": {
+            str(i): (float(evaluations[i][-1]) if len(evaluations[i]) > 0 else None)
+            for i in range(config.num_actors)
+        },
+        "best_scores": {
+            str(i): (float(max(evaluations[i])) if len(evaluations[i]) > 0 else None)
+            for i in range(config.num_actors)
+        },
+        "files": {
+            "train_jsonl": train_log_file if config.save_train_logs else None,
+            "eval_jsonl": eval_log_file,
+        },
     }
     
-    with open(log_file, "w") as f:
+    with open(summary_file, "w") as f:
         json.dump(eval_summary, f, indent=2)
     
-    print(f"\n로그 저장 완료: {log_file}", flush=True)
+    print(f"\n로그 저장 완료:", flush=True)
+    if config.save_train_logs:
+        print(f"  train:   {train_log_file}", flush=True)
+    print(f"  eval:    {eval_log_file}", flush=True)
+    print(f"  summary: {summary_file}", flush=True)
+    
+    # wandb 종료
+    if config.use_wandb:
+        wandb.finish()
     
     # Checkpoint 저장: results/{algorithm}/{env}/seed_{seed}/checkpoints/
-    env_name = config.env.replace("-", "_")
     checkpoint_dir = os.path.join("results", config.algorithm, env_name, f"seed_{config.seed}", "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
@@ -1496,7 +1392,7 @@ def train(config: TrainConfig):
         if actor_targets[i] is not None:
             ckpt[f"actor_{i}_target"] = actor_targets[i].state_dict()
     
-    checkpoint_file = os.path.join(checkpoint_dir, f"model_{timestamp}.pt")
+    checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{global_env_step}.pt")
     torch.save(ckpt, checkpoint_file)
     print(f"Checkpoint 저장 완료: {checkpoint_file}", flush=True)
 

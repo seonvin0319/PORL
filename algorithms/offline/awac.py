@@ -14,6 +14,16 @@ import torch.nn as nn
 import torch.nn.functional
 import wandb
 from tqdm import trange
+from .networks import GaussianMLP, build_mlp
+from .utils_pytorch import (
+    ReplayBuffer,
+    set_seed,
+    wandb_init,
+    eval_actor,
+    compute_mean_std,
+    normalize_states,
+    wrap_env,
+)
 
 TensorBatch = List[torch.Tensor]
 
@@ -50,67 +60,8 @@ class TrainConfig:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
 
-class ReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        buffer_size: int,
-        device: str = "cpu",
-    ):
-        self._buffer_size = buffer_size
-        self._pointer = 0
-        self._size = 0
-
-        self._states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._actions = torch.zeros(
-            (buffer_size, action_dim), dtype=torch.float32, device=device
-        )
-        self._rewards = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._next_states = torch.zeros(
-            (buffer_size, state_dim), dtype=torch.float32, device=device
-        )
-        self._dones = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-        self._device = device
-
-    def _to_tensor(self, data: np.ndarray) -> torch.Tensor:
-        return torch.tensor(data, dtype=torch.float32, device=self._device)
-
-    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
-        if self._size != 0:
-            raise ValueError("Trying to load data into non-empty replay buffer")
-        n_transitions = data["observations"].shape[0]
-        if n_transitions > self._buffer_size:
-            raise ValueError(
-                "Replay buffer is smaller than the dataset you are trying to load!"
-            )
-        self._states[:n_transitions] = self._to_tensor(data["observations"])
-        self._actions[:n_transitions] = self._to_tensor(data["actions"])
-        self._rewards[:n_transitions] = self._to_tensor(data["rewards"][..., None])
-        self._next_states[:n_transitions] = self._to_tensor(data["next_observations"])
-        self._dones[:n_transitions] = self._to_tensor(data["terminals"][..., None])
-        self._size += n_transitions
-        self._pointer = min(self._size, n_transitions)
-
-        print(f"Dataset size: {n_transitions}")
-
-    def sample(self, batch_size: int) -> TensorBatch:
-        indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
-        states = self._states[indices]
-        actions = self._actions[indices]
-        rewards = self._rewards[indices]
-        next_states = self._next_states[indices]
-        dones = self._dones[indices]
-        return [states, actions, rewards, next_states, dones]
-
-    def add_transition(self):
-        # Use this method to add new data into the replay buffer during fine-tuning.
-        # I left it unimplemented since now we do not do fine-tuning.
-        raise NotImplementedError
-
-
+# Actor는 pogo_policies.py의 GaussianMLP로 통합됨 (tanh_mean=False로 AWAC 방식 사용)
+# AWAC는 unbounded mean에서 샘플링 후 clamp 사용
 class Actor(nn.Module):
     def __init__(
         self,
@@ -123,51 +74,36 @@ class Actor(nn.Module):
         max_action: float = 1.0,
     ):
         super().__init__()
-        self._mlp = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
+        # AWAC는 3개의 hidden layer 사용 (256 -> 256 -> 256)
+        # tanh_mean=False: unbounded mean에서 샘플링 후 clamp (AWAC 방식)
+        self.policy = GaussianMLP(
+            state_dim, action_dim, max_action,
+            hidden_dim=hidden_dim, n_hiddens=3, tanh_mean=False
         )
-        self._log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
-        self._min_log_std = min_log_std
-        self._max_log_std = max_log_std
         self._min_action = min_action
         self._max_action = max_action
 
-    def _get_policy(self, state: torch.Tensor) -> torch.distributions.Distribution:
-        mean = self._mlp(state)
-        log_std = self._log_std.clamp(self._min_log_std, self._max_log_std)
-        policy = torch.distributions.Normal(mean, log_std.exp())
-        return policy
-
     def log_prob(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        policy = self._get_policy(state)
-        log_prob = policy.log_prob(action).sum(-1, keepdim=True)
-        return log_prob
+        return self.policy.log_prob(state, action)
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        policy = self._get_policy(state)
-        action = policy.rsample()
-        action.clamp_(self._min_action, self._max_action)
-        log_prob = policy.log_prob(action).sum(-1, keepdim=True)
-        return action, log_prob
+        return self.policy(state)
 
     def act(self, state: np.ndarray, device: str) -> np.ndarray:
         state_t = torch.tensor(state[None], dtype=torch.float32, device=device)
-        policy = self._get_policy(state_t)
-        if self._mlp.training:
-            action_t = policy.sample()
-        else:
-            action_t = policy.mean
-        action = action_t[0].cpu().numpy()
-        return action
+        action_t, _ = self.policy(state_t)
+        return action_t[0].cpu().numpy()
+
+
+
+
+def soft_update(target: nn.Module, source: nn.Module, tau: float):
+    for target_param, source_param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
 class Critic(nn.Module):
+    """Critic network for AWAC (networks.py의 build_mlp 사용)"""
     def __init__(
         self,
         state_dim: int,
@@ -175,24 +111,12 @@ class Critic(nn.Module):
         hidden_dim: int,
     ):
         super().__init__()
-        self._mlp = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        layers = build_mlp(state_dim + action_dim, hidden_dim=hidden_dim, n_hiddens=3)
+        self._mlp = nn.Sequential(*layers)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         q_value = self._mlp(torch.cat([state, action], dim=-1))
         return q_value
-
-
-def soft_update(target: nn.Module, source: nn.Module, tau: float):
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.copy_((1 - tau) * target_param.data + tau * source_param.data)
 
 
 class AdvantageWeightedActorCritic:
@@ -302,62 +226,8 @@ class AdvantageWeightedActorCritic:
         self._critic_2.load_state_dict(state_dict["critic_2"])
 
 
-def set_seed(
-    seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
-):
-    if env is not None:
-        env.seed(seed)
-        env.action_space.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(deterministic_torch)
-
-
-def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
-    mean = states.mean(0)
-    std = states.std(0) + eps
-    return mean, std
-
-
-def normalize_states(states: np.ndarray, mean: np.ndarray, std: np.ndarray):
-    return (states - mean) / std
-
-
-def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-) -> gym.Env:
-    def normalize_state(state):
-        return (state - state_mean) / state_std
-
-    env = gym.wrappers.TransformObservation(env, normalize_state)
-    return env
-
-
-@torch.no_grad()
-def eval_actor(
-    env: gym.Env, actor: Actor, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.seed(seed)
-    actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-        episode_rewards.append(episode_reward)
-
-    actor.train()
-    return np.asarray(episode_rewards)
-
-
 def return_reward_range(dataset, max_episode_steps):
+    """Return reward range for reward normalization"""
     returns, lengths = [], []
     ep_ret, ep_len = 0.0, 0
     for r, d in zip(dataset["rewards"], dataset["terminals"]):
@@ -373,23 +243,13 @@ def return_reward_range(dataset, max_episode_steps):
 
 
 def modify_reward(dataset, env_name, max_episode_steps=1000):
+    """Modify reward for specific environments"""
     if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
         min_ret, max_ret = return_reward_range(dataset, max_episode_steps)
         dataset["rewards"] /= max_ret - min_ret
         dataset["rewards"] *= max_episode_steps
     elif "antmaze" in env_name:
         dataset["rewards"] -= 1.0
-
-
-def wandb_init(config: dict) -> None:
-    wandb.init(
-        config=config,
-        project=config["project"],
-        group=config["group"],
-        name=config["name"],
-        id=str(uuid.uuid4()),
-    )
-    wandb.run.save()
 
 
 @pyrallis.wrap()
@@ -478,6 +338,102 @@ def train(config: TrainConfig):
                 )
 
     wandb.finish()
+
+
+# ============================================================================
+# POGO Multi-Actor Interface 구현
+# ============================================================================
+
+from typing import Any, Dict, List
+
+# 순환 참조 방지를 위해 파일 끝에서 import
+from .utils_pytorch import PyTorchAlgorithmInterface
+
+
+class AWACAlgorithm(PyTorchAlgorithmInterface):
+    """AWAC 알고리즘의 POGO Multi-Actor 인터페이스 구현"""
+    def __init__(self, trainer: 'AdvantageWeightedActorCritic'):
+        self.trainer = trainer
+    
+    def update_critic(
+        self,
+        trainer: Any,
+        batch: TensorBatch,
+        log_dict: Dict[str, float],
+        **kwargs
+    ) -> Dict[str, float]:
+        """AWAC의 Critic 업데이트"""
+        if not hasattr(trainer, "total_it"):
+            trainer.total_it = 0
+        trainer.total_it += 1
+        states, actions, rewards, next_states, dones = batch
+        trainer._actor = kwargs['actors'][0]  # 임시로 첫 번째 actor 연결
+        critic_loss = trainer._update_critic(states, actions, rewards, dones, next_states)
+        log_dict["critic_loss"] = critic_loss
+        return log_dict
+    
+    def compute_actor_loss(
+        self,
+        trainer: Any,
+        actor: nn.Module,
+        batch: TensorBatch,
+        actor_idx: int,
+        actor_is_stochastic: bool,
+        seed_base: int,
+        **kwargs
+    ) -> torch.Tensor:
+        """AWAC actor loss 계산"""
+        states, actions, rewards, next_states, dones = batch
+        
+        if actor_idx == 0:
+            # Actor0: AWAC loss
+            with torch.no_grad():
+                pi_action = actor.deterministic_actions(states)
+                v = torch.min(
+                    trainer._critic_1(states, pi_action),
+                    trainer._critic_2(states, pi_action)
+                )
+                q = torch.min(
+                    trainer._critic_1(states, actions),
+                    trainer._critic_2(states, actions)
+                )
+                adv = q - v
+                weights = torch.clamp_max(
+                    torch.exp(adv / trainer._awac_lambda), trainer._exp_adv_max
+                )
+            
+            if hasattr(actor, 'forward') and not actor_is_stochastic:
+                pi_i = actor.forward(states)
+            else:
+                pi_i = actor.sample_actions(states, K=1, seed=seed_base)[:, 0, :]
+            bc_losses = torch.sum((pi_i - actions) ** 2, dim=1)
+            return torch.mean(weights * bc_losses)
+        else:
+            # Actor1+: Q 기반 loss
+            if hasattr(actor, 'forward') and not actor_is_stochastic:
+                pi_i = actor.forward(states)
+            else:
+                pi_i = actor.sample_actions(states, K=1, seed=seed_base)[:, 0, :]
+            Q_i = torch.min(
+                trainer._critic_1(states, pi_i),
+                trainer._critic_2(states, pi_i)
+            )
+            return -Q_i.mean()
+    
+    def update_target_networks(
+        self,
+        trainer: Any,
+        actors: List[nn.Module],
+        actor_targets: List[nn.Module],
+        tau: float,
+        **kwargs
+    ) -> None:
+        """AWAC target network 업데이트"""
+        soft_update(trainer._target_critic_1, trainer._critic_1, trainer._tau)
+        soft_update(trainer._target_critic_2, trainer._critic_2, trainer._tau)
+        for actor, actor_target in zip(actors, actor_targets):
+            for p, tp in zip(actor.parameters(), actor_target.parameters()):
+                tp.data.copy_(trainer._tau * p.data + (1 - trainer._tau) * tp.data)
 
 
 if __name__ == "__main__":
