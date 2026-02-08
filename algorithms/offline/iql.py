@@ -264,20 +264,28 @@ class ImplicitQLearning:
         actions: torch.Tensor,
         log_dict: Dict,
     ):
+        # Original IQL (gwthomas/IQL-PyTorch): policy_out = actor(obs), Distribution->log_prob, Tensor->MSE
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        if hasattr(self.actor, "log_prob_actions"):
-            lp = self.actor.log_prob_actions(observations, actions)
-            bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
-        elif hasattr(self.actor, "log_prob_actions"):
-            lp = self.actor.log_prob_actions(observations, actions)
-            bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
-        else:
+        try:
             policy_out = self.actor(observations)
-            if isinstance(policy_out, torch.distributions.Distribution):
-                bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
+        except Exception:
+            # PORL GaussianMLP: forward(obs) 미지원 -> log_prob_actions 사용
+            policy_out = None
+        if policy_out is not None and isinstance(policy_out, torch.distributions.Distribution):
+            bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
+        elif policy_out is not None and torch.is_tensor(policy_out):
+            if policy_out.shape != actions.shape:
+                raise RuntimeError("Actions shape missmatch")
+            bc_losses = torch.sum((policy_out - actions) ** 2, dim=1)
+        else:
+            # Fallback: log_prob_actions (GaussianMLP 등)
+            if hasattr(self.actor, "log_prob_actions"):
+                lp = self.actor.log_prob_actions(observations, actions)
+                bc_losses = -lp.squeeze(-1) if lp.dim() > 1 else -lp
             else:
-                act = policy_out[0] if isinstance(policy_out, (tuple, list)) else policy_out
-                bc_losses = torch.sum((act - actions) ** 2, dim=1)
+                raise NotImplementedError(
+                    "Actor must return Distribution or Tensor from forward(obs), or implement log_prob_actions"
+                )
         policy_loss = torch.mean(exp_adv * bc_losses)
         log_dict["actor_loss"] = policy_loss.item()
         self.actor_optimizer.zero_grad()

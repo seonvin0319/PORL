@@ -224,6 +224,7 @@ def _create_actors(
     """config로 actor 생성: actor0=create_actor0(), actor1+=POGO policies.
     actor1+ type 미지정 시 base_config(저장된 config) 사용. base_config 없으면 actor0에서 추론.
     """
+    lr = float(lr)  # YAML에서 "3e-4" 등이 str로 올 수 있음
     actors = []
     actor_targets = []
     actor_optimizers = []
@@ -834,6 +835,14 @@ def train(config: TrainConfig):
     # configs/offline/{algorithm}/{env}/{task}.yaml에서 Actor0 파라미터 merge
     _merge_algorithm_config_from_env(config)
 
+    # YAML에서 "3e-4" 등이 str로 올 수 있으므로 lr 필드 float 보장
+    for k in ("actor_lr", "vf_lr", "qf_lr"):
+        if hasattr(config, k) and getattr(config, k) is not None:
+            try:
+                setattr(config, k, float(getattr(config, k)))
+            except (TypeError, ValueError):
+                pass
+
     # Seed 설정 (모든 랜덤 소스 초기화)
     # 환경 생성 전에 seed 설정하여 완전한 재현성 보장
     set_seed(config.seed, deterministic_torch=False)
@@ -1186,9 +1195,16 @@ def train(config: TrainConfig):
     else:
         raise ValueError(f"Unsupported algorithm: {config.algorithm}")
 
-    # W2 distance 계산 방법 결정 (Gaussian policy 사용 시 closed form W2)
+    # W2 distance 계산 방법 결정 (_compute_w2_distance 로직과 일치)
+    # Both Gaussian -> closed form W2 | Both stochastic -> Sinkhorn | At least one deterministic -> L2
     use_gaussian = any(actor_is_gaussian)
-    w2_method = "Wasserstein (closed form)" if use_gaussian else "Sinkhorn"
+    all_deterministic = not any(actor_is_stochastic)
+    if use_gaussian:
+        w2_method = "Wasserstein (closed form)"
+    elif all_deterministic:
+        w2_method = "L2"
+    else:
+        w2_method = "Sinkhorn"
     
     print("---------------------------------------", flush=True)
     print(f"Training POGO Multi-Actor ({config.algorithm.upper()}), Env: {config.env}, Seed: {config.seed}", flush=True)
