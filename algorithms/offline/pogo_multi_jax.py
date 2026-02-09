@@ -8,10 +8,12 @@ import os
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # For reproducibility
 
 import math
+import pickle
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import chex
@@ -26,28 +28,33 @@ import pyrallis
 import wandb
 from flax.core import FrozenDict
 from flax.training.train_state import TrainState
-from ott.geometry import pointcloud
-from ott.solvers.linear import solve as sinkhorn_solve
-# JAX utilities and ReBRAC imports (for now, can be extended to other algorithms)
-from .rebrac import (
-    Config as BaseConfig,
-    CriticTrainState,
+# JAX utilities
+from .utils_jax import (
+    ActorConfig,
     ActorTrainState,
+    AlgorithmInterface,
+    CriticTrainState,
     Metrics,
     ReplayBuffer,
-    update_critic,
-    update_actor,
-    update_td3,
-    wrap_env,
+    W2DistanceCalculator,
+    compute_mean_std,
     evaluate,
+    identity,
+    normalize_states,
+    pytorch_init,
     qlearning_dataset,
+    uniform_init,
+    wrap_env,
 )
-# AlgorithmInterface
-from .utils_jax import ReBRACAlgorithm
+# ReBRAC imports
+from .rebrac import (
+    Config as BaseConfig,
+    EnsembleCritic,
+    ReBRACAlgorithm,
+)
+# FQL imports
 from .fql import FQLAlgorithm
-from .pogo_policies_jax import FQLFlowPolicy, ActorVectorField
-# Network classes and utilities (from rebrac.py)
-from .rebrac import DetActor, Critic, EnsembleCritic, pytorch_init, uniform_init, identity, compute_mean_std, normalize_states
+from algorithms.networks.actors_jax import ActorVectorField
 # JAX Actor implementations
 from algorithms.networks.actors_jax import (
     GaussianMLP,
@@ -55,11 +62,6 @@ from algorithms.networks.actors_jax import (
     StochasticMLP,
     DeterministicMLP,
 )
-# AlgorithmInterface and ActorConfig
-from .utils_jax import AlgorithmInterface, ActorConfig
-
-default_kernel_init = nn.initializers.lecun_normal()
-default_bias_init = nn.initializers.zeros
 
 
 @dataclass
@@ -79,6 +81,9 @@ class Config(BaseConfig):
     # Wandb 설정
     use_wandb: bool = True  # wandb 사용 여부
     
+    # 알고리즘 타입
+    algorithm: str = "rebrac"  # "rebrac" or "fql"
+    
     # FQL 파라미터 (FQL 사용 시)
     q_agg: str = "mean"  # Q value aggregation: "mean" or "min"
     normalize_q_loss: bool = False  # Whether to normalize Q loss
@@ -87,6 +92,13 @@ class Config(BaseConfig):
     
     def __post_init__(self):
         super().__post_init__()
+        
+        # train_seed와 eval_seed가 None이면 기본값 설정 (config 파일에서 None/null로 설정된 경우 대비)
+        if self.train_seed is None:
+            self.train_seed = 0
+        if self.eval_seed is None:
+            self.eval_seed = 42
+        
         if self.num_actors is None:
             # w2_weights는 Actor1부터이므로 num_actors = len(w2_weights) + 1
             self.num_actors = len(self.w2_weights) + 1
@@ -110,128 +122,6 @@ class Config(BaseConfig):
 # Actor classes are now imported from algorithms.networks.actors_jax
 
 
-def sinkhorn_distance_jax(
-    x: jax.Array,
-    y: jax.Array,
-    blur: float = 0.05,
-    num_iterations: int = 100,
-) -> jax.Array:
-    """
-    Sinkhorn distance 계산 (OTT-jax 사용)
-    
-    Args:
-        x: [B, K, action_dim] 첫 번째 분포의 샘플
-        y: [B, K, action_dim] 두 번째 분포의 샘플 (detached)
-        blur: regularization parameter (epsilon)
-        num_iterations: Sinkhorn 알고리즘 반복 횟수 (OTT에서는 max_iterations로 전달)
-    
-    Returns:
-        [B] 각 state에 대한 Sinkhorn distance
-    """
-    B, K, action_dim = x.shape
-    
-    # Uniform weights for each point cloud
-    a = jnp.ones((B, K)) / K  # [B, K]
-    b = jnp.ones((B, K)) / K  # [B, K]
-    
-    def compute_sinkhorn_for_batch(x_i, y_i, a_i, b_i):
-        """Single batch Sinkhorn computation using OTT"""
-        # Create geometry object
-        geom = pointcloud.PointCloud(x_i, y_i, epsilon=blur)
-        
-        # Solve Sinkhorn
-        out = sinkhorn_solve(geom, a_i, b_i, max_iterations=num_iterations)
-        
-        # Extract distance (transport cost)
-        return out.reg_ot_cost
-    
-    # Vectorize over batch dimension
-    distances = jax.vmap(compute_sinkhorn_for_batch)(x, y, a, b)  # [B]
-    
-    return distances
-
-
-def closed_form_w2_gaussian(
-    mean1: jax.Array,
-    std1: jax.Array,
-    mean2: jax.Array,
-    std2: jax.Array,
-) -> jax.Array:
-    """
-    Closed form W2 distance for Gaussian distributions
-    W2² = ||μ1 - μ2||² + ||σ1 - σ2||²
-    
-    Args:
-        mean1: [B, action_dim] mean of first Gaussian
-        std1: [B, action_dim] std of first Gaussian
-        mean2: [B, action_dim] mean of second Gaussian
-        std2: [B, action_dim] std of second Gaussian
-    
-    Returns:
-        [B] per-state W2² distance
-    """
-    mean_diff = mean1 - mean2  # [B, action_dim]
-    std_diff = std1 - std2  # [B, action_dim]
-    
-    # W2² = ||μ1 - μ2||² + ||σ1 - σ2||²
-    w2_squared = jnp.sum(mean_diff ** 2, axis=-1) + jnp.sum(std_diff ** 2, axis=-1)  # [B]
-    return w2_squared
-
-
-def per_state_sinkhorn(
-    actor_i_config: ActorConfig,
-    ref_actor_config: ActorConfig,
-    states: jax.Array,
-    key: jax.random.PRNGKey,
-    K: int = 4,
-    blur: float = 0.05,
-) -> jax.Array:
-    """
-    Per-state distance 계산 (Gaussian closed form 또는 Sinkhorn 또는 L2)
-    
-    Args:
-        actor_i_config: 현재 actor 설정
-        ref_actor_config: 참조 actor 설정
-        states: [B, state_dim]
-        key: PRNG key
-        K: 샘플 수 (Gaussian이 아닌 경우에만 사용)
-        blur: Sinkhorn regularization (Gaussian이 아닌 경우에만 사용)
-    
-    Returns:
-        평균 distance (scalar)
-    """
-    # Both Gaussian: use closed form W2
-    if actor_i_config.is_gaussian and ref_actor_config.is_gaussian:
-        mean_i, std_i = actor_i_config.module.get_mean_std(actor_i_config.params, states)  # [B, action_dim]
-        mean_ref, std_ref = ref_actor_config.module.get_mean_std(ref_actor_config.params, states)  # [B, action_dim]
-        mean_ref = jax.lax.stop_gradient(mean_ref)
-        std_ref = jax.lax.stop_gradient(std_ref)
-        
-        w2_squared = closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref)  # [B]
-        return w2_squared.mean()
-    
-    # At least one is not Gaussian: use sampling-based methods
-    key1, key2 = jax.random.split(key)
-    
-    # Sample from current actor
-    a = actor_i_config.module.sample_actions(actor_i_config.params, states, key1, K)  # [B, K, action_dim]
-    
-    # Sample from reference actor (stop_gradient)
-    b = ref_actor_config.module.sample_actions(ref_actor_config.params, states, key2, K)  # [B, K, action_dim]
-    b = jax.lax.stop_gradient(b)
-    
-    if actor_i_config.is_stochastic and ref_actor_config.is_stochastic:
-        # Both stochastic (but not Gaussian): use Sinkhorn
-        distances = sinkhorn_distance_jax(a, b, blur=blur)  # [B]
-        return distances.mean()
-    else:
-        # At least one deterministic: use L2
-        a_det = a[:, 0, :]  # [B, action_dim] - take first sample
-        b_det = b[:, 0, :]  # [B, action_dim]
-        distances = jnp.sum((a_det - b_det) ** 2, axis=-1)  # [B]
-        return distances.mean()
-
-
 def update_multi_actor(
     key: jax.random.PRNGKey,
     actors: List[ActorTrainState],
@@ -243,18 +133,13 @@ def update_multi_actor(
     actor_is_gaussian: List[bool],
     actor_is_stochastic: List[bool],
     w2_weights: List[float],
-    sinkhorn_K: int,
-    sinkhorn_blur: float,
-    actor_bc_coef: float,  # actor loss에 사용 (algorithm 객체에도 저장되어 있음)
-    critic_bc_coef: float,  # critic 업데이트에 사용 (algorithm 객체에도 저장되어 있음)
+    w2_calculator: W2DistanceCalculator,
     gamma: float,
     tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    normalize_q: bool,
     total_steps: int = 0,
     policy_freq: int = 1,
     flow_policy_state: Optional[ActorTrainState] = None,  # FQL용
+    **kwargs,
 ) -> Tuple[jax.random.PRNGKey, List[ActorTrainState], CriticTrainState, Metrics, Optional[ActorTrainState]]:
 
     num_actors = len(actors)
@@ -269,73 +154,55 @@ def update_multi_actor(
         actor_module=actor_modules[0],
         metrics=metrics if metrics is not None else Metrics.create([]),
     )
+    # 2) Actor 및 Target 업데이트는 policy_freq 주기로만 실행
     should_update = (total_steps % policy_freq) == 0
 
     def do_policy_update(carry):
-        """policy_freq 스텝: actor(0..end) 업데이트 + target 업데이트"""
+        """policy_freq 주기: Actor(0..end) 업데이트 + 모든 Target 네트워크 업데이트"""
         key, actors, critic, metrics, flow_policy_state = carry
 
         updated_key = key
         updated_metrics = metrics
-        updated_actors: List[ActorTrainState] = []
+        updated_actors = [None] * num_actors
 
-        # ---------- Actor0 업데이트 (policy_freq일 때만) ----------
+        # ---------- Actor0 업데이트 ----------
         actor0 = actors[0]
         actor0_module = actor_modules[0]
         updated_key, actor0_key = jax.random.split(updated_key)
         
-        # FQL의 경우: update_actor0 사용 (flow_policy_params와 actor_params 동시 업데이트)
-        is_fql_algorithm = isinstance(algorithm, FQLAlgorithm)
-        if is_fql_algorithm:
-            if flow_policy_state is None:
-                raise ValueError("flow_policy_state must be provided for FQL algorithm")
-            updated_key, new_actor0, new_flow_policy_state, updated_metrics = algorithm.update_actor0(
-                updated_key,
-                actor0,
-                actor0_module,
-                critic,
-                batch,
-                flow_policy_state=flow_policy_state,
-                tau=tau,
-                metrics=updated_metrics,
-            )
-            updated_actors.append(new_actor0)
-            flow_policy_state = new_flow_policy_state
-        else:
-            # ReBRAC 등의 경우: 기존 로직 사용
-            def actor0_loss_fn(params: FrozenDict) -> Tuple[jax.Array, Metrics]:
-                # key는 알고리즘 compute_actor_loss가 필요 시 쓰라고 전달 (ReBRAC은 안 씀)
-                loss = algorithm.compute_actor_loss(
-                    params,
-                    actor0_module,
-                    critic,            # new_critic를 넣어야 함
-                    batch,
-                    actor_idx=0,
-                    key=actor0_key,
+        updated_key, new_actor0, new_flow_policy_state, updated_metrics = algorithm.update_actor0(
+            updated_key,
+            actor0,
+            actor0_module,
+            critic,
+            batch,
+            flow_policy_state=flow_policy_state,
+            tau=tau,
+            metrics=updated_metrics,
+        )
+        
+        new_actor0 = new_actor0.replace(
+            target_params=optax.incremental_update(new_actor0.params, actor0.target_params, tau)
+        )
+        
+        if new_flow_policy_state is not None:
+            new_flow_policy_state = new_flow_policy_state.replace(
+                target_params=optax.incremental_update(
+                    new_flow_policy_state.params, flow_policy_state.target_params, tau
                 )
-                m = updated_metrics.update({f"actor_0_loss": loss})
-                return loss, m
-
-            (loss0, updated_metrics), grads0 = jax.value_and_grad(actor0_loss_fn, has_aux=True)(actor0.params)
-            new_actor0 = actor0.apply_gradients(grads=grads0)
-            # actor target update (원본 TD3 스타일: policy update 시점에만)
-            new_actor0 = new_actor0.replace(
-                target_params=optax.incremental_update(new_actor0.params, actor0.target_params, tau)
             )
-            updated_actors.append(new_actor0)
+            flow_policy_state = new_flow_policy_state
+        
+        updated_actors[0] = new_actor0
 
-        # ---------- Actor1+ 업데이트 (policy_freq일 때만, 기존 로직 유지) ----------
-        # Actor0의 params와 module을 Actor1+에서 사용할 수 있도록 저장
-        actor0_params_for_1plus = new_actor0.params  # 업데이트된 Actor0 params
+        # ---------- Actor1+ 업데이트 ----------
+        actor0_params_for_1plus = new_actor0.params
         actor0_module_for_1plus = actor_modules[0]
         
         for i in range(1, num_actors):
             actor_i = actors[i]
             actor_module_i = actor_modules[i]
-            # ref_actor: 업데이트 전 이전 actor 참조 (고정 기준)
-            # Note: POGO 설계에서 W2 penalty는 같은 스텝에서 업데이트된 직전 actor를 기준으로 할 수도 있지만,
-            # 현재는 "고정 기준(이전 스텝 값)"을 사용하여 일관성 유지
-            ref_actor = actors[i - 1]
+            ref_actor = updated_actors[i - 1]
             ref_actor_module = actor_modules[i - 1]
             w2_weight_i = w2_weights[i - 1]
 
@@ -360,19 +227,17 @@ def update_multi_actor(
                     mean_ref, std_ref = ref_actor_module.get_mean_std(ref_actor.params, batch["states"])
                     mean_ref = jax.lax.stop_gradient(mean_ref)
                     std_ref = jax.lax.stop_gradient(std_ref)
-                    w2_dist = closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref).mean()
+                    w2_dist = w2_calculator.closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref).mean()
 
                 elif actor_is_stochastic[i] and actor_is_stochastic[i - 1]:
                     key_w2, _ = jax.random.split(w2_key)
                     actor_i_config = ActorConfig(params=params, module=actor_module_i, is_stochastic=True, is_gaussian=False)
                     ref_actor_config = ActorConfig(params=ref_actor.params, module=ref_actor_module, is_stochastic=True, is_gaussian=False)
-                    w2_dist = per_state_sinkhorn(
+                    w2_dist = w2_calculator.compute_distance(
                         actor_i_config=actor_i_config,
                         ref_actor_config=ref_actor_config,
                         states=batch["states"],
                         key=key_w2,
-                        K=sinkhorn_K,
-                        blur=sinkhorn_blur,
                     )
                 else:
                     # deterministic/L2 fallback
@@ -402,7 +267,7 @@ def update_multi_actor(
             new_actor_i = new_actor_i.replace(
                 target_params=optax.incremental_update(new_actor_i.params, actor_i.target_params, tau)
             )
-            updated_actors.append(new_actor_i)
+            updated_actors[i] = new_actor_i
 
         # ---------- Critic target update도 policy update 시점에만 ----------
         # Note: critic은 do_policy_update carry로 들어온 값 (바깥에서 이미 new_critic로 업데이트됨)
@@ -412,13 +277,13 @@ def update_multi_actor(
             target_params=optax.incremental_update(critic.params, critic.target_params, tau),
         )
 
-        return updated_key, updated_actors, new_critic2, updated_metrics, flow_policy_state
+        return updated_key, tuple(updated_actors), new_critic2, updated_metrics, flow_policy_state
 
     def skip_policy_update(carry):
         """non-policy step: actor/targets는 그대로, critic은 이미 업데이트된 params만 유지"""
         key, actors, critic, metrics, flow_policy_state = carry
         # 원본 ReBRAC처럼: 이 스텝에서는 target들을 건드리지 않음
-        return key, actors, critic, metrics, flow_policy_state
+        return key, tuple(actors), critic, metrics, flow_policy_state
 
     # cond 입력 carry: (key, actors, new_critic, new_metrics, flow_policy_state)
     key, new_actors, new_critic_final, new_metrics_final, new_flow_policy_state = jax.lax.cond(
@@ -428,7 +293,7 @@ def update_multi_actor(
         (key, actors, new_critic, new_metrics, flow_policy_state),
     )
 
-    return key, new_actors, new_critic_final, new_metrics_final, new_flow_policy_state
+    return key, list(new_actors), new_critic_final, new_metrics_final, new_flow_policy_state
 
 
 def _parse_args_with_no_wandb():
@@ -493,9 +358,8 @@ def main(config: Config):
     action_dim = init_action.shape[-1]
     max_action = float(eval_env.action_space.high[0])
 
-    # 알고리즘 판단: FQL 파라미터가 설정되어 있으면 FQL로 판단
-    # (flow_steps가 기본값이 아니거나, q_agg가 설정되어 있으면 FQL)
-    is_fql = hasattr(config, 'flow_steps') and config.flow_steps > 0
+    # 알고리즘 판단: config.algorithm으로 직접 지정
+    is_fql = config.algorithm.lower() == "fql"
     
     # Create multiple actors
     actors = []
@@ -534,10 +398,7 @@ def main(config: Config):
     actor0_is_gaussian = getattr(actor0_module, 'is_gaussian', False)
     
     # Actor0 타입 추론
-    # FQLFlowPolicy는 FQL 알고리즘에서 사용되지만, 타입은 deterministic으로 분류
-    if isinstance(actor0_module, FQLFlowPolicy):
-        actor0_type = "deterministic"  # FQLFlowPolicy는 deterministic으로 분류
-    elif isinstance(actor0_module, GaussianMLP):
+    if isinstance(actor0_module, GaussianMLP):
         actor0_type = "gaussian"
     elif isinstance(actor0_module, TanhGaussianMLP):
         actor0_type = "tanh_gaussian"
@@ -700,7 +561,7 @@ def main(config: Config):
 
     # 알고리즘 객체 생성
     if is_fql:
-        # Flow policy 생성 (actor_bc_flow, 별도 네트워크, GELU activation)
+        # Flow policy 생성 (ActorVectorField, actor_bc_flow 역할)
         flow_policy = ActorVectorField(
             hidden_dim=config.hidden_dim,
             action_dim=action_dim,
@@ -743,8 +604,11 @@ def main(config: Config):
             normalize_q=config.normalize_q,
         )
     
-    # 통합된 update_multi_actor 사용 (PyTorch 버전과 구조 일치)
-    # flow_policy_state는 partial에 고정하지 않고 매 스텝 carry에서 전달 (업데이트 반영을 위해)
+    # W2 Distance 계산기 생성
+    w2_calculator = W2DistanceCalculator(
+        sinkhorn_blur=config.sinkhorn_blur,
+        sinkhorn_K=config.sinkhorn_K,
+    )
     update_multi_actor_partial = partial(
         update_multi_actor,
         algorithm=algorithm,
@@ -752,15 +616,9 @@ def main(config: Config):
         actor_is_gaussian=actor_is_gaussian,
         actor_is_stochastic=actor_is_stochastic,
         w2_weights=config.w2_weights,
-        sinkhorn_K=config.sinkhorn_K,
-        sinkhorn_blur=config.sinkhorn_blur,
-        actor_bc_coef=config.actor_bc_coef,  # actor loss에 사용
-        critic_bc_coef=config.critic_bc_coef,  # critic 업데이트에 사용 (algorithm 객체에도 저장됨)
+        w2_calculator=w2_calculator,
         gamma=config.gamma,
         tau=config.tau,
-        policy_noise=config.policy_noise,
-        noise_clip=config.noise_clip,
-        normalize_q=config.normalize_q,
         policy_freq=getattr(config, "policy_freq", 1),
     )
 
@@ -815,9 +673,6 @@ def main(config: Config):
         is_gaussian = actor_is_gaussian[actor_idx]
         is_stoch = actor_is_stochastic[actor_idx]
         
-        # FQLFlowPolicy인지 확인
-        is_fql_flow = isinstance(actor_module, FQLFlowPolicy)
-        
         # StochasticMLP의 경우 key를 내부에서 생성 (evaluation용)
         if is_stoch:
             base_key = jax.random.PRNGKey(42)  # Evaluation용 base key
@@ -851,10 +706,7 @@ def main(config: Config):
                 else:
                     squeeze_output = False
                 
-                if is_fql_flow:
-                    # FQLFlowPolicy: deterministic_actions 메서드 사용
-                    actions = actor_module.deterministic_actions(params, obs)
-                elif is_gaussian:
+                if is_gaussian:
                     # GaussianMLP: use mean
                     mean, _ = actor_module.apply(params, obs)
                     actions = mean
@@ -868,17 +720,72 @@ def main(config: Config):
         
         return _action_fn
 
+    def _parse_env_name(env_name: str) -> Tuple[str, str]:
+        """환경 이름을 파싱하여 (env, task) 반환
+        예: 'halfcheetah-medium-v2' -> ('halfcheetah', 'medium_v2')
+            'hopper-medium-expert-v2' -> ('hopper', 'medium_expert_v2')
+        """
+        parts = env_name.split("-")
+        if len(parts) < 2:
+            return parts[0], "-".join(parts[1:]) if len(parts) > 1 else "default"
+        
+        # 첫 번째 부분이 환경 이름 (halfcheetah, hopper, walker2d 등)
+        env = parts[0]
+        # 나머지가 task (medium-v2, medium-expert-v2 등)
+        task = "_".join(parts[1:])
+        
+        return env, task
+
+    # Checkpoint 저장 디렉토리 미리 생성
+    env_name, task_name = _parse_env_name(config.dataset_name)
+    checkpoint_dir = os.path.join("results", config.algorithm, env_name, task_name, f"seed_{config.train_seed}", "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    def save_checkpoint(carry: Dict[str, Any], timestep: int, suffix: str = "", 
+                        evaluations: Optional[Dict[int, List[float]]] = None,
+                        metrics: Optional[Dict[str, np.ndarray]] = None):
+        """체크포인트 저장 함수"""
+        ckpt = {
+            "config": asdict(config),
+            "actors": [actor.params for actor in carry["actors"]],
+            "actor_targets": [actor.target_params for actor in carry["actors"]],
+            "critic": carry["critic"].params,
+            "total_steps": timestep,
+        }
+        
+        # FQL의 경우 flow_policy_state도 저장
+        if is_fql and carry.get("flow_policy_state") is not None:
+            ckpt["flow_policy_state"] = carry["flow_policy_state"].params
+            ckpt["flow_policy_target"] = carry["flow_policy_state"].target_params
+        
+        # 평가 결과 저장
+        if evaluations is not None:
+            ckpt["evaluations"] = {str(k): v for k, v in evaluations.items()}  # JAX array를 list로 변환
+        
+        # 학습 메트릭 저장
+        if metrics is not None:
+            ckpt["metrics"] = {k: float(v) if isinstance(v, (np.ndarray, jnp.ndarray)) else v 
+                              for k, v in metrics.items()}
+        
+        checkpoint_file = os.path.join(checkpoint_dir, f"model_step{timestep}{suffix}.pkl")
+        with open(checkpoint_file, "wb") as f:
+            pickle.dump(ckpt, f)
+        print(f"Checkpoint 저장 완료: {checkpoint_file}", flush=True)
+
     print("---------------------------------------")
-    print(f"Training POGO Multi-Actor (JAX), Env: {config.dataset_name}, Seed: {config.train_seed}")
+    print(f"Training POGO Multi-Actor (JAX), Algorithm: {config.algorithm.upper()}, Env: {config.dataset_name}, Seed: {config.train_seed}")
     print(f"  Actors: {config.num_actors}, W2 weights (Actor1+): {config.w2_weights}")
     print("  Actor0: 원래 알고리즘 loss만 사용")
-    print("  Actor1+: 알고리즘 loss + W2 distance")
+    print("  Actor1+: Energy Function + W2 distance")
     print("    - Gaussian actors: Closed form W2 (||μ1-μ2||² + ||σ1-σ2||²)")
     print("    - TanhGaussian/Stochastic actors: Sinkhorn distance")
     print("    - Stochastic (non-Gaussian): Sinkhorn distance")
     print("    - Deterministic: L2 distance")
     print(f"  Actor types: {[config.actor_configs[i].get('type', 'deterministic') for i in range(config.num_actors)]}")
     print("---------------------------------------")
+
+    # 평가 결과 저장용 리스트
+    evaluations = {i: [] for i in range(config.num_actors)}
 
     for epoch in range(config.num_epochs):
         # Reset metrics every epoch
@@ -900,6 +807,11 @@ def main(config: Config):
                 {"epoch": epoch, "total_steps": total_steps, **{f"POGO_Multi_JAX/{k}": v for k, v in mean_metrics.items()}}
             )
 
+        # 500k timestep마다 체크포인트 저장
+        if total_steps % 500000 == 0 and total_steps > 0:
+            save_checkpoint(update_carry, total_steps, "_mid", 
+                          evaluations=evaluations, metrics=mean_metrics)
+
         # eval_freq는 update step 기준 (PyTorch 버전과 동일)
         if total_steps % config.eval_freq == 0 or (epoch == config.num_epochs - 1):
             # Evaluate each actor
@@ -918,6 +830,8 @@ def main(config: Config):
                 norm_score = float(np.mean(normalized_score))
                 raw_std = float(np.std(eval_returns))
                 norm_std = float(np.std(normalized_score))
+                
+                evaluations[actor_idx].append(norm_score)
                 
                 actor_results.append({
                     "raw_avg": raw_avg,
@@ -939,12 +853,31 @@ def main(config: Config):
             
             # 평가 결과를 한 번에 출력 (PyTorch 버전과 동일한 형식)
             print("---------------------------------------", flush=True)
-            print(f"[Training] Time steps: {total_steps}", flush=True)
+            print(f"[Training] Algorithm: {config.algorithm.upper()}, Env: {config.dataset_name}, Time steps: {total_steps}", flush=True)
             print(f"Evaluation over {config.eval_episodes} episodes:", flush=True)
             for actor_idx in range(config.num_actors):
                 r = actor_results[actor_idx]
                 print(f"  Actor {actor_idx} - Raw: {r['raw_avg']:.3f} ± {r['raw_std']:.3f}, D4RL score: {r['norm_score']:.1f} ± {r['norm_std']:.1f}", flush=True)
             print("---------------------------------------", flush=True)
+
+    # 학습 완료 후 final 체크포인트 저장
+    print("\n" + "=" * 60, flush=True)
+    print("Training completed! Saving final checkpoint before evaluation...", flush=True)
+    print("=" * 60, flush=True)
+    final_steps = update_carry["total_steps"]
+    final_metrics = update_carry["metrics"].compute() if update_carry.get("metrics") is not None else None
+    save_checkpoint(update_carry, final_steps, "_final", 
+                  evaluations=evaluations, metrics=final_metrics)
+    
+    # 학습 완료 후 최종 평가
+    print("\n" + "=" * 60, flush=True)
+    print("======== Final Evaluation (trained weights) ========", flush=True)
+    print("=" * 60, flush=True)
+    for actor_idx in range(config.num_actors):
+        if evaluations[actor_idx]:
+            final_score = evaluations[actor_idx][-1]
+            best_score = max(evaluations[actor_idx])
+            print(f"[FINAL] Actor {actor_idx}: Final={final_score:.1f}, Best={best_score:.1f}", flush=True)
 
 
 if __name__ == "__main__":

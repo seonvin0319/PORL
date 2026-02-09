@@ -1,15 +1,119 @@
 # JAX Actor implementations
 # GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP
 
-from typing import Tuple
+from typing import Tuple, Optional, Callable
 
 import jax
 import jax.numpy as jnp
 from flax.core import FrozenDict
 from flax import linen as nn
 
-from ..offline.pogo_policies_jax import build_mlp_layers, build_base_network
-from ..offline.rebrac import uniform_init
+from ..offline.rebrac import pytorch_init, uniform_init, identity
+
+
+# ============================================================================
+# 공통 유틸리티 함수
+# ============================================================================
+
+def build_mlp_layers(
+    input_dim: int,
+    hidden_dim: int,
+    output_dim: int,
+    n_hiddens: int,
+    layernorm: bool = False,
+    final_activation=None,
+    activation=nn.relu,
+) -> list:
+    """공통 MLP 레이어 빌딩 함수
+    
+    Args:
+        input_dim: 입력 차원 (kernel init scale 계산용, 실제 Dense shape 추론은 Flax가 자동 수행)
+        hidden_dim: Hidden layer 차원
+        output_dim: 출력 차원
+        n_hiddens: Hidden layer 개수
+        layernorm: LayerNorm 적용 여부
+        final_activation: 마지막 레이어 activation (None이면 적용 안 함)
+        activation: Hidden layer activation (기본값: nn.relu, FQL에서는 nn.gelu 사용)
+    
+    Returns:
+        레이어 리스트
+    """
+    s_d, h_d = input_dim, hidden_dim
+    layers = [
+        nn.Dense(
+            hidden_dim,
+            kernel_init=pytorch_init(s_d),
+            bias_init=nn.initializers.constant(0.1),
+        ),
+        activation,
+        nn.LayerNorm() if layernorm else identity,
+    ]
+    for _ in range(n_hiddens - 1):
+        layers += [
+            nn.Dense(
+                hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
+            ),
+            activation,
+            nn.LayerNorm() if layernorm else identity,
+        ]
+    layers += [
+        nn.Dense(
+            output_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        ),
+    ]
+    if final_activation is not None:
+        layers.append(final_activation)
+    return layers
+
+
+def build_base_network(
+    input_dim: int,
+    hidden_dim: int,
+    n_hiddens: int,
+    layernorm: bool = False,
+) -> nn.Module:
+    """Base network builder for Gaussian/TanhGaussian policies
+    
+    Args:
+        input_dim: Input dimension (kernel init scale 계산용)
+        hidden_dim: Hidden layer dimension
+        n_hiddens: Number of hidden layers
+        layernorm: Whether to apply layer normalization
+    
+    Returns:
+        Base network Sequential module (output: hidden_dim)
+    """
+    layers = []
+    # First layer
+    layers.append(
+        nn.Dense(
+            hidden_dim,
+            kernel_init=pytorch_init(input_dim),
+            bias_init=nn.initializers.constant(0.1),
+        )
+    )
+    layers.append(nn.relu)
+    if layernorm:
+        layers.append(nn.LayerNorm())
+    
+    # Hidden layers
+    for _ in range(n_hiddens - 1):
+        layers.append(
+            nn.Dense(
+                hidden_dim,
+                kernel_init=pytorch_init(hidden_dim),
+                bias_init=nn.initializers.constant(0.1),
+            )
+        )
+        layers.append(nn.relu)
+        if layernorm:
+            layers.append(nn.LayerNorm())
+    
+    return nn.Sequential(layers)
 
 
 class GaussianMLP(nn.Module):
@@ -467,12 +571,14 @@ class ActorVectorField(nn.Module):
         n_hiddens: Number of hidden layers.
         layer_norm: Whether to apply layer normalization.
         encoder: Optional encoder module to encode the inputs.
+        activation: Activation function name ("relu" or "gelu", 기본값: "relu")
     """
     hidden_dim: int = 256
     action_dim: int = 1
     n_hiddens: int = 2
     layer_norm: bool = False
     encoder: nn.Module = None
+    activation: str = "relu"  # "relu" or "gelu"
 
     @nn.compact
     def __call__(self, observations, actions, times=None, is_encoded=False):
@@ -494,17 +600,32 @@ class ActorVectorField(nn.Module):
         else:
             inputs = jnp.concatenate([observations, actions, times], axis=-1)
 
-        # 공통 MLP 레이어 빌딩 함수 사용
-        layers = build_mlp_layers(
-            input_dim=inputs.shape[-1],
-            hidden_dim=self.hidden_dim,
-            output_dim=self.action_dim,
-            n_hiddens=self.n_hiddens,
-            layernorm=self.layer_norm,
-            final_activation=None,  # velocity 출력이므로 activation 없음
-        )
-        net = nn.Sequential(layers)
-        v = net(inputs)
+        # Activation 함수 선택 (모듈 필드에서 가져옴)
+        if self.activation == "gelu":
+            act = nn.gelu
+        elif self.activation == "relu":
+            act = nn.relu
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
+        
+        # 직접 레이어 구성
+        h = inputs
+        for _ in range(self.n_hiddens):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h.shape[-1]),
+                bias_init=nn.initializers.constant(0.1),
+            )(h)
+            if self.layer_norm:
+                h = nn.LayerNorm()(h)
+            h = act(h)
+        
+        # Output layer (velocity, activation 없음)
+        v = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(h)
         
         return v
 
@@ -538,13 +659,14 @@ class FQLFlowPolicy(nn.Module):
             encoder=self.encoder,
         )
         
-        # actor_onestep_flow: one-step policy (times=None)
-        self.actor_onestep_flow = ActorVectorField(
-            hidden_dim=self.hidden_dim,
+        # actor_onestep_flow: one-step policy (StochasticMLP 사용)
+        self.actor_onestep_flow = StochasticMLP(
             action_dim=self.action_dim,
+            max_action=self.max_action,
+            hidden_dim=self.hidden_dim,
+            layernorm=self.layernorm,
             n_hiddens=self.n_hiddens,
-            layer_norm=self.layernorm,
-            encoder=self.encoder,
+            activation="gelu",  # FQL: GELU activation
         )
     
     def __call__(self, state: jax.Array, noise: jax.Array, times: jax.Array = None, use_onestep: bool = True) -> jax.Array:
@@ -566,8 +688,8 @@ class FQLFlowPolicy(nn.Module):
             _ = self.actor_bc_flow(state, noise, times, is_encoded=False)
         
         if use_onestep:
-            # Use actor_onestep_flow for forward pass
-            return self.actor_onestep_flow(state, noise, times=None, is_encoded=False)
+            # Use actor_onestep_flow (StochasticMLP): state + z -> action
+            return self.actor_onestep_flow(state, noise)
         else:
             # Use actor_bc_flow (requires times)
             if times is None:
@@ -618,7 +740,7 @@ class FQLFlowPolicy(nn.Module):
         key: jax.random.PRNGKey,
         K: int = 1,
     ) -> jax.Array:
-        """Sample K actions using actor_onestep_flow
+        """Sample K actions using actor_onestep_flow (StochasticMLP)
         
         Args:
             params: Full FQLFlowPolicy parameters
@@ -629,32 +751,19 @@ class FQLFlowPolicy(nn.Module):
         Returns:
             actions: [B, K, action_dim]
         """
-        B = state.shape[0]
-        state_dim = state.shape[-1]
-        noise = jax.random.normal(key, (B, K, self.action_dim))
+        # Extract actor_onestep_flow params (StochasticMLP)
+        onestep_params = params.get("actor_onestep_flow", params)
         
-        # Tile state to [B, K, state_dim] and flatten to [B*K, state_dim]
-        state_tiled = jnp.expand_dims(state, axis=1)  # [B, 1, state_dim]
-        state_tiled = jnp.tile(state_tiled, (1, K, 1))  # [B, K, state_dim]
-        state_flat = state_tiled.reshape(B * K, state_dim)  # [B*K, state_dim]
-        noise_flat = noise.reshape(B * K, self.action_dim)  # [B*K, action_dim]
-        
-        # Use full module apply with use_onestep=True to call actor_onestep_flow
-        actions_flat = self.apply(
-            params,
-            state_flat,
-            noise_flat,
-            times=None,
-            use_onestep=True,
+        # Use StochasticMLP's sample_actions method
+        return self.actor_onestep_flow.sample_actions(
+            onestep_params,
+            state,
+            key,
+            K=K,
         )
-        
-        # Reshape back to [B, K, action_dim]
-        actions = actions_flat.reshape(B, K, self.action_dim)
-        actions = jnp.clip(actions, -1, 1) * self.max_action
-        return actions
     
     def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
-        """Deterministic action: use z=0 noise
+        """Deterministic action: use z=0 noise (StochasticMLP)
         
         Args:
             params: Full FQLFlowPolicy parameters
@@ -663,14 +772,11 @@ class FQLFlowPolicy(nn.Module):
         Returns:
             actions: [B, action_dim]
         """
-        noise = jnp.zeros((state.shape[0], self.action_dim), dtype=state.dtype)
+        # Extract actor_onestep_flow params (StochasticMLP)
+        onestep_params = params.get("actor_onestep_flow", params)
         
-        # Use full module apply with use_onestep=True to call actor_onestep_flow
-        actions = self.apply(
-            params,
+        # Use StochasticMLP's deterministic_actions method
+        return self.actor_onestep_flow.deterministic_actions(
+            onestep_params,
             state,
-            noise,
-            times=None,
-            use_onestep=True,
         )
-        return jnp.clip(actions, -1, 1) * self.max_action

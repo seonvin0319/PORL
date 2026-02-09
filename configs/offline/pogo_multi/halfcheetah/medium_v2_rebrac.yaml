@@ -1,5 +1,6 @@
 # POGO Multi-Actor with ReBRAC algorithm (JAX)
 # ReBRAC의 구조를 그대로 사용하되, Actor만 multi-actor
+# 원래 rebrac config에서 w2 설정만 추가됨
 
 dataset_name: halfcheetah-medium-v2
 train_seed: 0
@@ -15,25 +16,25 @@ num_actors: 3
 #   - "stochastic": Stochastic policy (Sinkhorn distance 사용)
 #   - "deterministic": Deterministic policy (L2 distance 사용)
 actor_configs:
-  - type: deterministic  # Actor0: deterministic
-  - type: gaussian       # Actor1: Gaussian (closed form W2)
-  - type: gaussian       # Actor2: Gaussian (closed form W2)
+  - type: deterministic
+  - type: deterministic
+  - type: deterministic
 
 # Sinkhorn 설정 (Actor1+용)
 sinkhorn_K: 4
 sinkhorn_blur: 0.05
 sinkhorn_backend: "auto"
 
-# ReBRAC 파라미터 (ReBRAC 구조 그대로 사용)
-actor_learning_rate: 1e-3
-critic_learning_rate: 1e-3
+# ReBRAC 파라미터 (원래 config 값 유지)
+actor_learning_rate: 0.001
+critic_learning_rate: 0.001
 hidden_dim: 256
 actor_n_hiddens: 3
 critic_n_hiddens: 3
 gamma: 0.99
-tau: 5e-3
-actor_bc_coef: 1.0
-critic_bc_coef: 1.0
+tau: 0.005
+actor_bc_coef: 0.001
+critic_bc_coef: 0.01
 actor_ln: false
 critic_ln: true
 policy_noise: 0.2
@@ -50,9 +51,8 @@ normalize_states: false
 
 # Evaluation params
 eval_episodes: 10
-eval_every: 5
 
 # Wandb
 project: PORL
 group: pogo-multi-rebrac
-name: pogo-multi-rebrac
+name: pogo-multi-rebrac-halfcheetah_medium_v2

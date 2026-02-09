@@ -476,6 +476,10 @@ def _train_multi_actor(
                 return trainer.compute_energy_function(**kwargs)
 
             actor_i_config = ActorConfig.from_actor(actors[i])
+            # ref_actor: 업데이트된 이전 actor 참조 (같은 스텝에서 업데이트된 직전 actor)
+            # Actor1의 경우: trainer.train/update에서 이미 업데이트된 actors[0]
+            # Actor2의 경우: 이전 루프에서 이미 업데이트된 actors[1]
+            # PyTorch에서는 actors 리스트가 in-place로 업데이트되므로 actors[i - 1]이 이미 업데이트된 상태
             ref_actor_config = ActorConfig.from_actor(actors[i - 1])
             w2_weight_i = w2_weights[i - 1]
             actor_loss_i, w2_i = _compute_actor_loss_with_w2(

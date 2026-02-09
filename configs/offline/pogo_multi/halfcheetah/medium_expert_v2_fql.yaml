@@ -1,0 +1,49 @@
+dataset_name: halfcheetah-medium-expert-v2
+train_seed: 0
+eval_seed: 42
+
+# Algorithm
+algorithm: fql
+# POGO Multi-Actor 설정
+w2_weights: [10.0, 10.0]
+num_actors: 3
+actor_configs:
+  - type: stochastic
+  - type: stochastic
+  - type: stochastic
+
+# Sinkhorn 설정
+sinkhorn_K: 4
+sinkhorn_blur: 0.05
+sinkhorn_backend: auto
+
+# Learning rates
+actor_learning_rate: 0.0003
+critic_learning_rate: 0.0003
+
+# Network architecture
+hidden_dim: 512
+actor_n_hiddens: 4
+critic_n_hiddens: 4
+
+# Training
+batch_size: 256
+num_epochs: 1000
+num_updates_on_epoch: 1000
+
+# FQL specific
+gamma: 0.99
+tau: 0.005
+alpha: 30.0
+flow_steps: 10
+q_agg: mean
+normalize_q_loss: false
+
+# Evaluation
+eval_episodes: 10
+eval_freq: 5000
+
+# Wandb
+project: PORL
+group: pogo-multi-fql
+name: pogo-multi-fql-halfcheetah_medium_expert_v2

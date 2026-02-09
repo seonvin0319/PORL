@@ -1,6 +1,6 @@
 # FQL Algorithm for POGO Multi-Actor integration
 # Adapted from https://github.com/seohongpark/fql
-# Note: FQLFlowPolicy는 pogo_policies_jax.py에 정의되어 있음
+# Note: FQLFlowPolicy는 pogo_policies_jax.py에 정의되어 있음 (참고용, 실제로는 사용하지 않음)
 
 from typing import Dict, Optional, Tuple
 
@@ -12,7 +12,6 @@ from flax import linen as nn
 
 from .utils_jax import AlgorithmInterface
 from .rebrac import ActorTrainState, CriticTrainState, Metrics
-from .pogo_policies_jax import FQLFlowPolicy
 
 
 class FQLAlgorithm(AlgorithmInterface):
@@ -21,13 +20,15 @@ class FQLAlgorithm(AlgorithmInterface):
     FQL (Flow Q-Learning) 알고리즘을 POGO Multi-Actor 구조에 통합.
     ReBRAC와 동일한 방식으로 AlgorithmInterface를 구현.
     
-    FQL의 multi-step flow matching 구조:
-    - actor_bc_flow: multi-step flow matching (velocity field 학습)
-    - actor_onestep_flow: one-step policy (빠른 샘플링)
+    FQL의 구조:
+    - flow_policy (ActorVectorField): multi-step flow matching (velocity field 학습, actor_bc_flow)
+    - actor_module (StochasticMLP): one-step policy (빠른 샘플링, actor_onestep_flow 역할)
     
     Actor loss:
-    - Actor0: BC flow loss만 (BC policy)
-    - Actor1+: Q loss만 (-Q, W2는 _update_single_actor에서 자동 추가됨)
+    - Actor0: flow matching loss + (-Q + alpha(actor_0 - pi_flow)^2)
+      - actor_0: StochasticMLP에서 샘플링 (one-step BC policy)
+      - pi_flow: flow_policy에서 flow matching으로 계산된 action
+    - Actor1+: Q loss만 (-Q, W2는 pogo_multi_jax에서 자동 추가됨)
     """
     def __init__(
         self,
@@ -47,8 +48,8 @@ class FQLAlgorithm(AlgorithmInterface):
             normalize_q_loss: Whether to normalize Q loss
             alpha: Distillation loss coefficient (BC flow loss는 항상 1.0)
             flow_steps: Number of flow steps for BC flow
-            flow_policy: Flow policy network (actor_bc_flow, 별도 네트워크)
-            Note: flow_policy_params는 제거됨. flow_policy_state를 외부에서 관리하고 update_actor0에 전달
+            flow_policy: Flow policy network (ActorVectorField, actor_bc_flow 역할, 별도 네트워크)
+            Note: flow_policy_state를 외부에서 관리하고 update_actor0에 전달
         """
         self.gamma = gamma
         self.tau = tau
@@ -162,14 +163,10 @@ class FQLAlgorithm(AlgorithmInterface):
             metrics = Metrics.create([])
         
         if flow_policy_state is None:
-            # flow_policy_state가 없으면 self.flow_policy_params를 사용 (초기화만)
-            # 실제로는 flow_policy_state를 전달해야 함
             raise ValueError("flow_policy_state must be provided for FQL")
         
         B = batch['states'].shape[0]
         action_dim = batch["actions"].shape[-1]
-        # max_action 타입 일관성: float로 변환
-        # max_action: JIT 안전성을 위해 jnp.asarray로 처리
         max_action = getattr(actor_module, "max_action", 1.0)
         max_action = jnp.asarray(max_action, dtype=jnp.float32)
         
@@ -177,15 +174,13 @@ class FQLAlgorithm(AlgorithmInterface):
         def loss_fn(flow_params: FrozenDict, actor_params: FrozenDict, loss_key: jax.random.PRNGKey) -> Tuple[jax.Array, Metrics]:
             loss_key, t_key, noise_key, flow_noise_key = jax.random.split(loss_key, 4)
             
-            # 1. Flow matching loss: flow_policy (actor_bc_flow) 학습 (x0=normal, x1=action)
+            # 1. Flow matching loss: flow_policy (ActorVectorField, actor_bc_flow 역할) 학습
             x0 = jax.random.normal(noise_key, (B, action_dim))
             x1 = batch['actions'] / max_action
             x1 = jnp.clip(x1, -1.0, 1.0)
             t = jax.random.uniform(t_key, (B, 1), minval=0.0, maxval=1.0)
             x_t = (1 - t) * x0 + t * x1
             v_target = x1 - x0
-            
-            # FQL: GELU activation (모듈 필드로 고정됨)
             v_pred = self.flow_policy.apply(
                 flow_params,
                 batch['states'],
@@ -195,21 +190,17 @@ class FQLAlgorithm(AlgorithmInterface):
             flow_loss = jnp.mean((v_pred - v_target) ** 2)
             
             # 2. One-step BC policy loss: -Q + alpha(actor_0 - pi_flow)^2
-            # actor_0: StochasticMLP에서 z를 샘플링 (one-step BC policy)
+            # actor_0: StochasticMLP (actor_onestep_flow 역할)에서 z를 샘플링
             loss_key, z_key = jax.random.split(loss_key)
             z = jax.random.normal(z_key, (B, action_dim))
-            # FQL: GELU activation 사용 (키워드 인자로 전달)
-            # FQL: GELU activation (모듈 필드로 고정됨)
             actor_0 = actor_module.apply(actor_params, batch['states'], z)
             actor_0 = jnp.clip(actor_0, -max_action, max_action)
             
-            # pi_flow: flow_policy에서 sampling
-            # x0_flow는 normal에서 샘플링
+            # pi_flow: flow_policy (ActorVectorField)에서 flow matching으로 계산된 action
             x0_flow = jax.random.normal(flow_noise_key, (B, action_dim))
             x_t_flow = x0_flow
             for step in range(self.flow_steps):
                 t_flow = jnp.full((B, 1), step / self.flow_steps)
-                # FQL: GELU activation (모듈 필드로 고정됨)
                 v_t = self.flow_policy.apply(
                     flow_params,
                     batch['states'],
@@ -250,152 +241,8 @@ class FQLAlgorithm(AlgorithmInterface):
         new_flow_policy_state = flow_policy_state.apply_gradients(grads=flow_grads)
         new_actor = actor.apply_gradients(grads=actor_grads)
         
-        # Target network updates
-        new_flow_policy_state = new_flow_policy_state.replace(
-            target_params=optax.incremental_update(
-                new_flow_policy_state.params, flow_policy_state.target_params, tau
-            )
-        )
-        new_actor = new_actor.replace(
-            target_params=optax.incremental_update(
-                new_actor.params, actor.target_params, tau
-            )
-        )
-        
+        # Target network updates는 update_multi_actor의 do_policy_update에서 통합적으로 처리
         return key, new_actor, new_flow_policy_state, updated_metrics
-    
-    def compute_actor_loss(
-        self,
-        actor_params: FrozenDict,
-        actor_module: nn.Module,
-        critic: CriticTrainState,
-        batch: Dict[str, jax.Array],
-        actor_idx: int = 0,
-        key: Optional[jax.random.PRNGKey] = None,
-        **kwargs
-    ) -> jax.Array:
-        """FQL actor loss 계산
-        
-        FQL의 actor loss:
-        - Actor0: -Q + alpha(actor_0 - pi_flow)^2
-          - actor_0 = actor_onestep_flow(state, noise=0)
-          - pi_flow = actor_bc_flow에서 flow matching으로 계산된 action
-          - actor_bc_flow는 별도로 x0=norm, x1=action으로 학습됨
-        - Actor1+: compute_actor_loss는 사용하지 않음 (energy function + W2 사용)
-        
-        Args:
-            actor_params: Actor parameters
-            actor_module: FQLFlowPolicy module (Actor0만)
-            critic: Critic train state
-            batch: Batch data
-            actor_idx: Actor index (0 for Actor0 only)
-            key: PRNG key (required for FQL)
-            **kwargs: Additional arguments
-        
-        Returns:
-            Actor loss (scalar)
-        """
-        if key is None:
-            raise ValueError("FQL requires key to be provided")
-        
-        # Actor0만 compute_actor_loss 사용: flow matching loss + (-Q + alpha(actor_0 - pi_flow)^2)
-        # Note: FQL에서는 update_actor0를 사용하므로 이 함수는 호출되지 않아야 함
-        # 하지만 호출될 경우를 대비해 flow_policy_state를 kwargs에서 받도록 함
-        if actor_idx == 0:
-            if self.flow_policy is None:
-                raise ValueError("FQL requires flow_policy to be provided")
-            
-            # flow_policy_state는 kwargs에서 받거나, 없으면 에러
-            flow_policy_state = kwargs.get('flow_policy_state', None)
-            if flow_policy_state is None:
-                raise ValueError("FQL compute_actor_loss requires flow_policy_state. Use update_actor0 instead.")
-            flow_policy_params = flow_policy_state.params
-            
-            key, t_key, noise_key, flow_noise_key = jax.random.split(key, 4)
-            B = batch['states'].shape[0]
-            action_dim = batch["actions"].shape[-1]
-            # max_action 타입 일관성: float로 변환
-            # max_action: JIT 안전성을 위해 jnp.asarray로 처리
-            max_action = getattr(actor_module, "max_action", 1.0)
-            max_action = jnp.asarray(max_action, dtype=jnp.float32)
-            
-            # 1. Flow matching loss: flow_policy (actor_bc_flow) 학습 (x0=normal, x1=action)
-            # x0: normal distribution에서 샘플링
-            x0 = jax.random.normal(noise_key, (B, action_dim))
-
-            # x1: action from dataset (normalized to [-1, 1])
-            x1 = batch['actions'] / max_action  # Normalize to [-1, 1]
-            x1 = jnp.clip(x1, -1.0, 1.0)
-            
-            # Random time t ~ U[0, 1]
-            t = jax.random.uniform(t_key, (B, 1), minval=0.0, maxval=1.0)
-            
-            # Interpolated point: x_t = (1-t) * x0 + t * x1
-            x_t = (1 - t) * x0 + t * x1
-            
-            # Target velocity: v_target = x1 - x0
-            v_target = x1 - x0  # [B, action_dim]
-            
-            # Predicted velocity from flow_policy (actor_bc_flow)
-            # FQL: GELU activation (모듈 필드로 고정됨)
-            v_pred = self.flow_policy.apply(
-                flow_policy_params,
-                batch['states'],
-                x_t,
-                times=t,
-            )  # [B, action_dim]
-            
-            # Flow matching loss: ||v_pred - v_target||^2
-            flow_loss = jnp.mean((v_pred - v_target) ** 2)
-            
-            # 2. One-step BC policy loss: -Q + alpha(actor_0 - pi_flow)^2
-            # actor_0: StochasticMLP에서 z를 샘플링 (one-step BC policy)
-            key, z_key = jax.random.split(key)
-            z = jax.random.normal(z_key, (B, action_dim))
-            # FQL: GELU activation (모듈 필드로 고정됨)
-            actor_0 = actor_module.apply(actor_params, batch['states'], z)
-            actor_0 = jnp.clip(actor_0, -max_action, max_action)
-            
-            # pi_flow: flow_policy (velocity field)에서 sampling해서 뽑은 action
-            # x0_flow: normal distribution에서 샘플링
-            x0_flow = jax.random.normal(flow_noise_key, (B, action_dim))
-            
-            # Euler method로 velocity field를 따라가면서 action 생성
-            x_t_flow = x0_flow
-            for step in range(self.flow_steps):
-                t_flow = jnp.full((B, 1), step / self.flow_steps)
-                # velocity field에서 velocity 가져오기
-                # FQL: GELU activation (모듈 필드로 고정됨)
-                v_t = self.flow_policy.apply(
-                    flow_policy_params,
-                    batch['states'],
-                    x_t_flow,
-                    times=t_flow,
-                )
-                # Euler step: x_{t+dt} = x_t + v_t * dt
-                x_t_flow = x_t_flow + v_t / self.flow_steps
-            
-            # pi_flow: 최종 action (normalized to [-1, 1] 범위로 clip 후 max_action 곱)
-            pi_flow = jnp.clip(x_t_flow, -1.0, 1.0) * max_action
-            
-            # Q loss: -Q(state, actor_0)
-            qs = critic.apply_fn(critic.params, batch["states"], actor_0)  # [num_critics, B]
-            q = qs.mean(axis=0) if self.q_agg == 'mean' else qs.min(axis=0)
-            q_loss = -q.mean()
-            if self.normalize_q_loss:
-                lam = jax.lax.stop_gradient(1.0 / jnp.abs(q).mean())
-                q_loss = lam * q_loss
-            
-            # Distillation loss: alpha * ||actor_0 - pi_flow||^2
-            actor_0_norm = actor_0 / max_action
-            pi_flow_norm = pi_flow / max_action
-            distil_loss = self.alpha * jnp.mean((actor_0_norm - pi_flow_norm) ** 2)
-            
-            # Total loss: flow matching loss + one-step BC policy loss
-            return flow_loss + q_loss + distil_loss
-        else:
-            # Actor1+는 compute_actor_loss 사용하지 않음 (energy function + W2 사용)
-            raise ValueError("Actor1+ should use compute_energy_function + W2, not compute_actor_loss")
     
     def compute_energy_function(
         self,

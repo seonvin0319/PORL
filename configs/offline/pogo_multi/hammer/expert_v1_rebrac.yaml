@@ -1,40 +1,58 @@
-algorithm: rebrac
+# POGO Multi-Actor with ReBRAC algorithm (JAX)
+# ReBRAC의 구조를 그대로 사용하되, Actor만 multi-actor
+# 원래 rebrac config에서 w2 설정만 추가됨
+
 dataset_name: hammer-expert-v1
 train_seed: 0
 eval_seed: 42
-w2_weights:
-- 100.0
-- 100.0
+
+# POGO Multi-Actor 설정
+# w2_weights: Actor1부터의 가중치 리스트 (Actor0는 W2 penalty 없음)
+w2_weights: [10.0, 10.0]
 num_actors: 3
+# actor_configs: 각 actor의 타입 지정
+#   - "gaussian": Gaussian policy (mean에 tanh 적용된 상태에서 샘플링, closed form W2 사용)
+#   - "tanh_gaussian": TanhGaussian policy (unbounded Gaussian에서 샘플링 후 tanh 적용, Sinkhorn 사용)
+#   - "stochastic": Stochastic policy (Sinkhorn distance 사용)
+#   - "deterministic": Deterministic policy (L2 distance 사용)
 actor_configs:
-- type: deterministic
-- type: deterministic
-- type: deterministic
+  - type: deterministic
+  - type: deterministic
+  - type: deterministic
+
+# Sinkhorn 설정 (Actor1+용)
 sinkhorn_K: 4
 sinkhorn_blur: 0.05
-sinkhorn_backend: auto
-actor_learning_rate: 1e-3
-critic_learning_rate: 1e-3
+sinkhorn_backend: "auto"
+
+# ReBRAC 파라미터 (원래 config 값 유지)
+actor_learning_rate: 0.0003
+critic_learning_rate: 0.0003
 hidden_dim: 256
 actor_n_hiddens: 3
 critic_n_hiddens: 3
 gamma: 0.99
-tau: 5e-3
-actor_bc_coef: 1.0
-critic_bc_coef: 1.0
+tau: 0.005
+actor_bc_coef: 0.01
+critic_bc_coef: 0.01
 actor_ln: false
 critic_ln: true
 policy_noise: 0.2
 noise_clip: 0.5
 policy_freq: 2
 normalize_q: true
-batch_size: 1024
+
+# Training params
+batch_size: 256
 num_epochs: 1000
 num_updates_on_epoch: 1000
 normalize_reward: false
 normalize_states: false
+
+# Evaluation params
 eval_episodes: 10
-eval_freq: 5000  # PyTorch 버전과 동일하게 timestep 기반 (5000 timestep마다)
+
+# Wandb
 project: PORL
 group: pogo-multi-rebrac
-name: pogo-multi-rebrac-hammer-expert-v1
+name: pogo-multi-rebrac-hammer_expert_v1
