@@ -8,7 +8,8 @@ import jax.numpy as jnp
 from flax.core import FrozenDict
 from flax import linen as nn
 
-from .mlp_jax import build_mlp_layers, build_base_network, uniform_init
+from ..offline.pogo_policies_jax import build_mlp_layers, build_base_network
+from ..offline.rebrac import uniform_init
 
 
 class GaussianMLP(nn.Module):
@@ -291,6 +292,7 @@ class StochasticMLP(nn.Module):
     hidden_dim: int = 256
     layernorm: bool = False
     n_hiddens: int = 2
+    activation: str = "relu"  # "relu" or "gelu"
     
     # Policy 타입 속성 (클래스 변수)
     is_gaussian: bool = False
@@ -302,21 +304,38 @@ class StochasticMLP(nn.Module):
         Forward pass: state + z -> action
         z must be provided (for deterministic, use z=0)
         """
-        # Concatenate state and z
-        x = jnp.concatenate([state, z], axis=-1)
+        # Activation 함수 선택
+        if self.activation == "gelu":
+            act = nn.gelu
+        elif self.activation == "relu":
+            act = nn.relu
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
         
-        # 공통 MLP 레이어 빌딩 함수 사용
-        layers = build_mlp_layers(
-            input_dim=x.shape[-1],
-            hidden_dim=self.hidden_dim,
-            output_dim=self.action_dim,
-            n_hiddens=self.n_hiddens,
-            layernorm=self.layernorm,
-            final_activation=nn.tanh,
-        )
-        net = nn.Sequential(layers)
-        actions = net(x) * self.max_action
-        return actions
+        # Concatenate state and z
+        h = jnp.concatenate([state, z], axis=-1)
+        
+        # 직접 레이어 구성
+        from ..offline.rebrac import pytorch_init, uniform_init
+        
+        for _ in range(self.n_hiddens):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h.shape[-1]),
+                bias_init=nn.initializers.constant(0.1),
+            )(h)
+            if self.layernorm:
+                h = nn.LayerNorm()(h)
+            h = act(h)
+        
+        # Output layer (tanh activation)
+        a = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(h)
+        a = jnp.tanh(a) * self.max_action
+        return a
 
     def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
         """Deterministic action: z = 0"""

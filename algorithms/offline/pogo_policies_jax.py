@@ -2,7 +2,7 @@
 # Policy Protocol: sample_actions, deterministic_actions, get_mean_std (for Gaussian)
 # GaussianMLP, TanhGaussianMLP, StochasticMLP, DeterministicMLP, FQLFlowPolicy
 
-from typing import Tuple
+from typing import Tuple, Optional, Callable
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +16,16 @@ from .rebrac import pytorch_init, uniform_init, identity
 # 공통 유틸리티 함수
 # ============================================================================
 
+def _get_act(name: Optional[str]) -> Callable:
+    """Activation 함수 이름을 함수로 변환"""
+    if name is None or name == "relu":
+        return nn.relu
+    if name == "gelu":
+        return nn.gelu
+    if name == "tanh":
+        return jnp.tanh
+    raise ValueError(f"Unknown activation: {name}")
+
 def build_mlp_layers(
     input_dim: int,
     hidden_dim: int,
@@ -23,6 +33,7 @@ def build_mlp_layers(
     n_hiddens: int,
     layernorm: bool = False,
     final_activation=None,
+    activation=nn.relu,
 ) -> list:
     """공통 MLP 레이어 빌딩 함수
     
@@ -33,6 +44,7 @@ def build_mlp_layers(
         n_hiddens: Hidden layer 개수
         layernorm: LayerNorm 적용 여부
         final_activation: 마지막 레이어 activation (None이면 적용 안 함)
+        activation: Hidden layer activation (기본값: nn.relu, FQL에서는 nn.gelu 사용)
     
     Returns:
         레이어 리스트
@@ -44,7 +56,7 @@ def build_mlp_layers(
             kernel_init=pytorch_init(s_d),
             bias_init=nn.initializers.constant(0.1),
         ),
-        nn.relu,
+        activation,
         nn.LayerNorm() if layernorm else identity,
     ]
     for _ in range(n_hiddens - 1):
@@ -54,7 +66,7 @@ def build_mlp_layers(
                 kernel_init=pytorch_init(h_d),
                 bias_init=nn.initializers.constant(0.1),
             ),
-            nn.relu,
+            activation,
             nn.LayerNorm() if layernorm else identity,
         ]
     layers += [
@@ -85,12 +97,14 @@ class ActorVectorField(nn.Module):
         n_hiddens: Number of hidden layers.
         layer_norm: Whether to apply layer normalization.
         encoder: Optional encoder module to encode the inputs.
+        activation: Activation function name ("relu" or "gelu", 기본값: "relu")
     """
     hidden_dim: int = 256
     action_dim: int = 1
     n_hiddens: int = 2
     layer_norm: bool = False
     encoder: nn.Module = None
+    activation: str = "relu"  # "relu" or "gelu"
 
     @nn.compact
     def __call__(self, observations, actions, times=None, is_encoded=False):
@@ -112,17 +126,32 @@ class ActorVectorField(nn.Module):
         else:
             inputs = jnp.concatenate([observations, actions, times], axis=-1)
 
-        # 공통 MLP 레이어 빌딩 함수 사용
-        layers = build_mlp_layers(
-            input_dim=inputs.shape[-1],
-            hidden_dim=self.hidden_dim,
-            output_dim=self.action_dim,
-            n_hiddens=self.n_hiddens,
-            layernorm=self.layer_norm,
-            final_activation=None,  # velocity 출력이므로 activation 없음
-        )
-        net = nn.Sequential(layers)
-        v = net(inputs)
+        # Activation 함수 선택 (모듈 필드에서 가져옴)
+        if self.activation == "gelu":
+            act = nn.gelu
+        elif self.activation == "relu":
+            act = nn.relu
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
+        
+        # 직접 레이어 구성
+        h = inputs
+        for _ in range(self.n_hiddens):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h.shape[-1]),
+                bias_init=nn.initializers.constant(0.1),
+            )(h)
+            if self.layer_norm:
+                h = nn.LayerNorm()(h)
+            h = act(h)
+        
+        # Output layer (velocity, activation 없음)
+        v = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(h)
         
         return v
 
@@ -563,6 +592,7 @@ class StochasticMLP(nn.Module):
     hidden_dim: int = 256
     layernorm: bool = False
     n_hiddens: int = 2
+    activation: str = "relu"  # "relu" or "gelu"
     
     # Policy 타입 속성 (클래스 변수)
     is_gaussian: bool = False
@@ -573,22 +603,41 @@ class StochasticMLP(nn.Module):
         """
         Forward pass: state + z -> action
         z must be provided (for deterministic, use z=0)
-        """
-        # Concatenate state and z
-        x = jnp.concatenate([state, z], axis=-1)
         
-        # 공통 MLP 레이어 빌딩 함수 사용
-        layers = build_mlp_layers(
-            input_dim=x.shape[-1],
-            hidden_dim=self.hidden_dim,
-            output_dim=self.action_dim,
-            n_hiddens=self.n_hiddens,
-            layernorm=self.layernorm,
-            final_activation=nn.tanh,
-        )
-        net = nn.Sequential(layers)
-        actions = net(x) * self.max_action
-        return actions
+        Args:
+            state: State array [B, state_dim]
+            z: Noise array [B, action_dim]
+        """
+        # Activation 함수 선택 (모듈 필드에서 가져옴)
+        if self.activation == "gelu":
+            act = nn.gelu
+        elif self.activation == "relu":
+            act = nn.relu
+        else:
+            raise ValueError(f"Unknown activation: {self.activation}")
+        
+        # Concatenate state and z
+        h = jnp.concatenate([state, z], axis=-1)
+        
+        # 직접 레이어 구성
+        for _ in range(self.n_hiddens):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h.shape[-1]),
+                bias_init=nn.initializers.constant(0.1),
+            )(h)
+            if self.layernorm:
+                h = nn.LayerNorm()(h)
+            h = act(h)
+        
+        # Output layer (tanh activation)
+        a = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(h)
+        a = jnp.tanh(a) * self.max_action
+        return a
 
     def deterministic_actions(self, params: FrozenDict, state: jax.Array) -> jax.Array:
         """Deterministic action: z = 0"""

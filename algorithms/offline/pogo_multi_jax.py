@@ -38,13 +38,16 @@ from .rebrac import (
     update_critic,
     update_actor,
     update_td3,
-    ReBRACAlgorithm,
+    wrap_env,
+    evaluate,
+    qlearning_dataset,
 )
-# Environment utilities (PyTorch의 utils_pytorch와 대응)
-from .utils_jax import wrap_env, evaluate, qlearning_dataset
-# Network classes and utilities
-from algorithms.networks.critics_jax import DetActor, Critic, EnsembleCritic
-from algorithms.networks.mlp_jax import pytorch_init, uniform_init, identity, compute_mean_std, normalize_states
+# AlgorithmInterface
+from .utils_jax import ReBRACAlgorithm
+from .fql import FQLAlgorithm
+from .pogo_policies_jax import FQLFlowPolicy, ActorVectorField
+# Network classes and utilities (from rebrac.py)
+from .rebrac import DetActor, Critic, EnsembleCritic, pytorch_init, uniform_init, identity, compute_mean_std, normalize_states
 # JAX Actor implementations
 from algorithms.networks.actors_jax import (
     GaussianMLP,
@@ -72,6 +75,15 @@ class Config(BaseConfig):
     sinkhorn_K: int = 4
     sinkhorn_blur: float = 0.05
     sinkhorn_backend: str = "auto"  # JAX에서는 ott-jax 사용 (실제로 OTT 사용)
+    
+    # Wandb 설정
+    use_wandb: bool = True  # wandb 사용 여부
+    
+    # FQL 파라미터 (FQL 사용 시)
+    q_agg: str = "mean"  # Q value aggregation: "mean" or "min"
+    normalize_q_loss: bool = False  # Whether to normalize Q loss
+    alpha: float = 10.0  # Distillation loss coefficient
+    flow_steps: int = 10  # Number of flow steps for BC flow
     
     def __post_init__(self):
         super().__post_init__()
@@ -220,242 +232,225 @@ def per_state_sinkhorn(
         return distances.mean()
 
 
-def update_multi_actor_gaussian(
+def update_multi_actor(
     key: jax.random.PRNGKey,
     actors: List[ActorTrainState],
     critic: CriticTrainState,
     batch: Dict[str, jax.Array],
     metrics: Metrics,
+    algorithm: AlgorithmInterface,
     actor_modules: List[nn.Module],
     actor_is_gaussian: List[bool],
-    w2_weights: List[float],
-    beta: float,
-    gamma: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    normalize_q: bool,
-) -> Tuple[jax.random.PRNGKey, List[ActorTrainState], CriticTrainState, Metrics]:
-    """
-    Multi-actor 업데이트 (Gaussian policy용 - closed form W2)
-    현재는 ReBRAC 구조를 사용하지만, 다른 알고리즘으로 확장 가능
-    """
-    num_actors = len(actors)
-    new_actors = []
-    new_metrics = metrics
-    
-    # Critic 업데이트는 Actor0만 사용
-    key, new_critic, new_metrics = update_critic(
-        key,
-        actors[0],
-        critic,
-        batch,
-        gamma=gamma,
-        beta=beta,
-        tau=tau,
-        policy_noise=policy_noise,
-        noise_clip=noise_clip,
-        metrics=new_metrics,
-    )
-    
-    # Multi-actor 업데이트
-    for i in range(num_actors):
-        actor_i = actors[i]
-        actor_module_i = actor_modules[i]
-        
-        key, actor_key = jax.random.split(key)
-        
-        def actor_loss_fn(params: FrozenDict) -> Tuple[jax.Array, Metrics]:
-            # GaussianMLP: use mean
-            mean_i, std_i = actor_module_i.get_mean_std(params, batch["states"])
-            
-            bc_penalty = ((mean_i - batch["actions"]) ** 2).sum(-1)
-            q_values = new_critic.apply_fn(new_critic.params, batch["states"], mean_i).min(0)
-            lmbda = 1.0
-            if normalize_q:
-                lmbda = jax.lax.stop_gradient(1.0 / jnp.abs(q_values).mean())
-            
-            if i == 0:
-                # Actor0: ReBRAC loss만 사용
-                loss = (beta * bc_penalty - lmbda * q_values).mean()
-                actor_metrics = new_metrics.update({
-                    f"actor_{i}_loss": loss,
-                    f"actor_{i}_bc_mse": bc_penalty.mean(),
-                })
-                return loss, actor_metrics
-            else:
-                # Actor1+: Closed form W2
-                ref_actor = actors[i - 1]
-                ref_actor_module = actor_modules[i - 1]
-                w2_weight_i = w2_weights[i - 1]
-                
-                rebrac_loss = (beta * bc_penalty - lmbda * q_values).mean()
-                
-                # Closed form W2
-                mean_ref, std_ref = ref_actor_module.get_mean_std(ref_actor.params, batch["states"])
-                mean_ref = jax.lax.stop_gradient(mean_ref)
-                std_ref = jax.lax.stop_gradient(std_ref)
-                
-                w2_dist = closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref).mean()
-                
-                loss = rebrac_loss + w2_weight_i * w2_dist
-                
-                actor_metrics = new_metrics.update({
-                    f"actor_{i}_loss": loss,
-                    f"actor_{i}_bc_mse": bc_penalty.mean(),
-                    f"w2_{i}_distance": w2_dist,
-                })
-                return loss, actor_metrics
-        
-        grads, actor_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor_i.params)
-        new_actor_i = actor_i.apply_gradients(grads=grads)
-        
-        new_actor_i = new_actor_i.replace(
-            target_params=optax.incremental_update(
-                new_actor_i.params, actor_i.target_params, tau
-            )
-        )
-        
-        new_actors.append(new_actor_i)
-        new_metrics = actor_metrics
-    
-    new_critic = new_critic.replace(
-        target_params=optax.incremental_update(
-            new_critic.params, critic.target_params, tau
-        )
-    )
-    
-    return key, new_actors, new_critic, new_metrics
-
-
-def update_multi_actor_stochastic(
-    key: jax.random.PRNGKey,
-    actors: List[ActorTrainState],
-    critic: CriticTrainState,
-    batch: Dict[str, jax.Array],
-    metrics: Metrics,
-    actor_modules: List[nn.Module],
     actor_is_stochastic: List[bool],
     w2_weights: List[float],
     sinkhorn_K: int,
     sinkhorn_blur: float,
-    beta: float,
+    actor_bc_coef: float,  # actor loss에 사용 (algorithm 객체에도 저장되어 있음)
+    critic_bc_coef: float,  # critic 업데이트에 사용 (algorithm 객체에도 저장되어 있음)
     gamma: float,
     tau: float,
     policy_noise: float,
     noise_clip: float,
     normalize_q: bool,
-) -> Tuple[jax.random.PRNGKey, List[ActorTrainState], CriticTrainState, Metrics]:
-    """
-    Multi-actor 업데이트 (Stochastic policy용 - Sinkhorn)
-    현재는 ReBRAC 구조를 사용하지만, 다른 알고리즘으로 확장 가능
-    """
+    total_steps: int = 0,
+    policy_freq: int = 1,
+    flow_policy_state: Optional[ActorTrainState] = None,  # FQL용
+) -> Tuple[jax.random.PRNGKey, List[ActorTrainState], CriticTrainState, Metrics, Optional[ActorTrainState]]:
+
     num_actors = len(actors)
-    new_actors = []
-    new_metrics = metrics
-    
-    # Critic 업데이트는 Actor0만 사용
-    key, new_critic, new_metrics = update_critic(
+
+    # 1) Critic 업데이트는 매 스텝 (원본 ReBRAC과 동일)
+    # critic_bc_coef는 algorithm 객체에 이미 저장되어 있으므로 전달 불필요
+    key, new_critic, new_metrics = algorithm.update_critic(
         key,
         actors[0],
         critic,
         batch,
-        gamma=gamma,
-        beta=beta,
-        tau=tau,
-        policy_noise=policy_noise,
-        noise_clip=noise_clip,
-        metrics=new_metrics,
+        actor_module=actor_modules[0],
+        metrics=metrics if metrics is not None else Metrics.create([]),
     )
-    
-    # Multi-actor 업데이트
-    for i in range(num_actors):
-        actor_i = actors[i]
-        actor_module_i = actor_modules[i]
+    should_update = (total_steps % policy_freq) == 0
+
+    def do_policy_update(carry):
+        """policy_freq 스텝: actor(0..end) 업데이트 + target 업데이트"""
+        key, actors, critic, metrics, flow_policy_state = carry
+
+        updated_key = key
+        updated_metrics = metrics
+        updated_actors: List[ActorTrainState] = []
+
+        # ---------- Actor0 업데이트 (policy_freq일 때만) ----------
+        actor0 = actors[0]
+        actor0_module = actor_modules[0]
+        updated_key, actor0_key = jax.random.split(updated_key)
         
-        key, actor_key = jax.random.split(key)
-        
-        def actor_loss_fn(params: FrozenDict) -> Tuple[jax.Array, Metrics]:
-            # Get deterministic actions
-            if actor_is_stochastic[i]:
-                z_zero = jnp.zeros((batch["states"].shape[0], actor_module_i.action_dim), dtype=batch["states"].dtype)
-                actions = actor_module_i.apply(params, batch["states"], z_zero)
-            else:
-                actions = actor_module_i.apply(params, batch["states"])
-            
-            bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
-            q_values = new_critic.apply_fn(new_critic.params, batch["states"], actions).min(0)
-            lmbda = 1.0
-            if normalize_q:
-                lmbda = jax.lax.stop_gradient(1.0 / jnp.abs(q_values).mean())
-            
-            if i == 0:
-                # Actor0: ReBRAC loss만 사용
-                loss = (beta * bc_penalty - lmbda * q_values).mean()
-                actor_metrics = new_metrics.update({
-                    f"actor_{i}_loss": loss,
-                    f"actor_{i}_bc_mse": bc_penalty.mean(),
-                })
-                return loss, actor_metrics
-            else:
-                # Actor1+: Sinkhorn or L2
-                ref_actor = actors[i - 1]
-                ref_actor_module = actor_modules[i - 1]
-                w2_weight_i = w2_weights[i - 1]
-                
-                rebrac_loss = (beta * bc_penalty - lmbda * q_values).mean()
-                
-                # W2 distance (Sinkhorn or L2) using ActorConfig
-                key_w2, _ = jax.random.split(actor_key)
-                actor_i_config = ActorConfig(
-                    params=params,
-                    module=actor_module_i,
-                    is_stochastic=actor_is_stochastic[i],
-                    is_gaussian=False,  # Stochastic이므로 Gaussian 아님
-                )
-                ref_actor_config = ActorConfig(
-                    params=ref_actor.params,
-                    module=ref_actor_module,
-                    is_stochastic=actor_is_stochastic[i - 1],
-                    is_gaussian=False,  # Stochastic이므로 Gaussian 아님
-                )
-                w2_dist = per_state_sinkhorn(
-                    actor_i_config=actor_i_config,
-                    ref_actor_config=ref_actor_config,
-                    states=batch["states"],
-                    key=key_w2,
-                    K=sinkhorn_K,
-                    blur=sinkhorn_blur,
-                )
-                
-                loss = rebrac_loss + w2_weight_i * w2_dist
-                
-                actor_metrics = new_metrics.update({
-                    f"actor_{i}_loss": loss,
-                    f"actor_{i}_bc_mse": bc_penalty.mean(),
-                    f"w2_{i}_distance": w2_dist,
-                })
-                return loss, actor_metrics
-        
-        grads, actor_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor_i.params)
-        new_actor_i = actor_i.apply_gradients(grads=grads)
-        
-        new_actor_i = new_actor_i.replace(
-            target_params=optax.incremental_update(
-                new_actor_i.params, actor_i.target_params, tau
+        # FQL의 경우: update_actor0 사용 (flow_policy_params와 actor_params 동시 업데이트)
+        is_fql_algorithm = isinstance(algorithm, FQLAlgorithm)
+        if is_fql_algorithm:
+            if flow_policy_state is None:
+                raise ValueError("flow_policy_state must be provided for FQL algorithm")
+            updated_key, new_actor0, new_flow_policy_state, updated_metrics = algorithm.update_actor0(
+                updated_key,
+                actor0,
+                actor0_module,
+                critic,
+                batch,
+                flow_policy_state=flow_policy_state,
+                tau=tau,
+                metrics=updated_metrics,
             )
-        )
+            updated_actors.append(new_actor0)
+            flow_policy_state = new_flow_policy_state
+        else:
+            # ReBRAC 등의 경우: 기존 로직 사용
+            def actor0_loss_fn(params: FrozenDict) -> Tuple[jax.Array, Metrics]:
+                # key는 알고리즘 compute_actor_loss가 필요 시 쓰라고 전달 (ReBRAC은 안 씀)
+                loss = algorithm.compute_actor_loss(
+                    params,
+                    actor0_module,
+                    critic,            # new_critic를 넣어야 함
+                    batch,
+                    actor_idx=0,
+                    key=actor0_key,
+                )
+                m = updated_metrics.update({f"actor_0_loss": loss})
+                return loss, m
+
+            (loss0, updated_metrics), grads0 = jax.value_and_grad(actor0_loss_fn, has_aux=True)(actor0.params)
+            new_actor0 = actor0.apply_gradients(grads=grads0)
+            # actor target update (원본 TD3 스타일: policy update 시점에만)
+            new_actor0 = new_actor0.replace(
+                target_params=optax.incremental_update(new_actor0.params, actor0.target_params, tau)
+            )
+            updated_actors.append(new_actor0)
+
+        # ---------- Actor1+ 업데이트 (policy_freq일 때만, 기존 로직 유지) ----------
+        # Actor0의 params와 module을 Actor1+에서 사용할 수 있도록 저장
+        actor0_params_for_1plus = new_actor0.params  # 업데이트된 Actor0 params
+        actor0_module_for_1plus = actor_modules[0]
         
-        new_actors.append(new_actor_i)
-        new_metrics = actor_metrics
-    
-    new_critic = new_critic.replace(
-        target_params=optax.incremental_update(
-            new_critic.params, critic.target_params, tau
+        for i in range(1, num_actors):
+            actor_i = actors[i]
+            actor_module_i = actor_modules[i]
+            # ref_actor: 업데이트 전 이전 actor 참조 (고정 기준)
+            # Note: POGO 설계에서 W2 penalty는 같은 스텝에서 업데이트된 직전 actor를 기준으로 할 수도 있지만,
+            # 현재는 "고정 기준(이전 스텝 값)"을 사용하여 일관성 유지
+            ref_actor = actors[i - 1]
+            ref_actor_module = actor_modules[i - 1]
+            w2_weight_i = w2_weights[i - 1]
+
+            updated_key, energy_key, w2_key = jax.random.split(updated_key, 3)
+
+            def actor_i_loss_fn(params: FrozenDict) -> Tuple[jax.Array, Metrics]:
+                # energy (Actor1+)
+                energy = algorithm.compute_energy_function(
+                    params,
+                    actor_module_i,
+                    critic,      # new_critic를 넣어야 함
+                    batch,
+                    key=energy_key,  # Sampling 기반 energy를 위한 key 전달
+                    is_stochastic=actor_is_stochastic[i],  # Actor 타입 정보 전달
+                    actor0_params=actor0_params_for_1plus,  # FQL용: Actor0 params 전달
+                    actor0_module=actor0_module_for_1plus,   # FQL용: Actor0 module 전달
+                )
+
+                # w2 (기존 로직 유지)
+                if actor_is_gaussian[i] and actor_is_gaussian[i - 1]:
+                    mean_i, std_i = actor_module_i.get_mean_std(params, batch["states"])
+                    mean_ref, std_ref = ref_actor_module.get_mean_std(ref_actor.params, batch["states"])
+                    mean_ref = jax.lax.stop_gradient(mean_ref)
+                    std_ref = jax.lax.stop_gradient(std_ref)
+                    w2_dist = closed_form_w2_gaussian(mean_i, std_i, mean_ref, std_ref).mean()
+
+                elif actor_is_stochastic[i] and actor_is_stochastic[i - 1]:
+                    key_w2, _ = jax.random.split(w2_key)
+                    actor_i_config = ActorConfig(params=params, module=actor_module_i, is_stochastic=True, is_gaussian=False)
+                    ref_actor_config = ActorConfig(params=ref_actor.params, module=ref_actor_module, is_stochastic=True, is_gaussian=False)
+                    w2_dist = per_state_sinkhorn(
+                        actor_i_config=actor_i_config,
+                        ref_actor_config=ref_actor_config,
+                        states=batch["states"],
+                        key=key_w2,
+                        K=sinkhorn_K,
+                        blur=sinkhorn_blur,
+                    )
+                else:
+                    # deterministic/L2 fallback
+                    if actor_is_gaussian[i]:
+                        actions_i, _ = actor_module_i.get_mean_std(params, batch["states"])
+                    elif actor_is_stochastic[i]:
+                        actions_i = actor_module_i.deterministic_actions(params, batch["states"])
+                    else:
+                        actions_i = actor_module_i.apply(params, batch["states"])
+
+                    if actor_is_gaussian[i - 1]:
+                        actions_ref, _ = ref_actor_module.get_mean_std(ref_actor.params, batch["states"])
+                    elif actor_is_stochastic[i - 1]:
+                        actions_ref = ref_actor_module.deterministic_actions(ref_actor.params, batch["states"])
+                    else:
+                        actions_ref = ref_actor_module.apply(ref_actor.params, batch["states"])
+
+                    actions_ref = jax.lax.stop_gradient(actions_ref)
+                    w2_dist = ((actions_i - actions_ref) ** 2).sum(-1).mean()
+
+                loss = energy + w2_weight_i * w2_dist
+                m = updated_metrics.update({f"actor_{i}_loss": loss, f"w2_{i}_distance": w2_dist})
+                return loss, m
+
+            (loss_i, updated_metrics), grads_i = jax.value_and_grad(actor_i_loss_fn, has_aux=True)(actor_i.params)
+            new_actor_i = actor_i.apply_gradients(grads=grads_i)
+            new_actor_i = new_actor_i.replace(
+                target_params=optax.incremental_update(new_actor_i.params, actor_i.target_params, tau)
+            )
+            updated_actors.append(new_actor_i)
+
+        # ---------- Critic target update도 policy update 시점에만 ----------
+        # Note: critic은 do_policy_update carry로 들어온 값 (바깥에서 이미 new_critic로 업데이트됨)
+        # target_params만 업데이트 (TD3 스타일: policy update 시점에만)
+        new_critic2 = critic.replace(
+            params=critic.params,  # 현재 critic.params는 이미 업데이트된 값
+            target_params=optax.incremental_update(critic.params, critic.target_params, tau),
         )
+
+        return updated_key, updated_actors, new_critic2, updated_metrics, flow_policy_state
+
+    def skip_policy_update(carry):
+        """non-policy step: actor/targets는 그대로, critic은 이미 업데이트된 params만 유지"""
+        key, actors, critic, metrics, flow_policy_state = carry
+        # 원본 ReBRAC처럼: 이 스텝에서는 target들을 건드리지 않음
+        return key, actors, critic, metrics, flow_policy_state
+
+    # cond 입력 carry: (key, actors, new_critic, new_metrics, flow_policy_state)
+    key, new_actors, new_critic_final, new_metrics_final, new_flow_policy_state = jax.lax.cond(
+        should_update,
+        do_policy_update,
+        skip_policy_update,
+        (key, actors, new_critic, new_metrics, flow_policy_state),
     )
+
+    return key, new_actors, new_critic_final, new_metrics_final, new_flow_policy_state
+
+
+def _parse_args_with_no_wandb():
+    """커스텀 argparse 파서: --no_wandb 옵션 지원"""
+    import argparse
+    import sys
     
-    return key, new_actors, new_critic, new_metrics
+    # 기본 pyrallis 파서 생성
+    parser = argparse.ArgumentParser()
+    
+    # --no_wandb 옵션 추가
+    parser.add_argument('--no_wandb', action='store_true', 
+                       help='wandb를 사용하지 않음 (--use_wandb False와 동일)')
+    
+    # 나머지 인자는 pyrallis가 처리하도록 전달
+    args, remaining = parser.parse_known_args()
+    
+    # --no_wandb가 설정되면 --use_wandb false로 변환 (config override)
+    if args.no_wandb:
+        sys.argv = [sys.argv[0]] + ['--use_wandb', 'false'] + remaining
+    else:
+        sys.argv = [sys.argv[0]] + remaining
 
 
 @pyrallis.wrap()
@@ -464,14 +459,17 @@ def main(config: Config):
     dict_config = asdict(config)
     dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
 
-    wandb.init(
-        config=dict_config,
-        project=config.project,
-        group=config.group,
-        name=config.name,
-        id=str(uuid.uuid4()),
-    )
-    wandb.mark_preempting()
+    if config.use_wandb:
+        wandb.init(
+            config=dict_config,
+            project=config.project,
+            group=config.group,
+            name=config.name,
+            id=str(uuid.uuid4()),
+        )
+        wandb.mark_preempting()
+    else:
+        print("[Wandb] 비활성화됨 (--no_wandb 또는 use_wandb: false)", flush=True)
     
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
@@ -479,8 +477,10 @@ def main(config: Config):
     )
 
     key = jax.random.PRNGKey(seed=config.train_seed)
-    key, actor_keys, critic_key = jax.random.split(key, config.num_actors + 2)
-    actor_keys = jax.random.split(actor_keys, config.num_actors)
+    keys = jax.random.split(key, config.num_actors + 2)
+    actor_keys = keys[:config.num_actors]
+    critic_key = keys[config.num_actors]
+    key = keys[config.num_actors + 1]  # 다음 split을 위한 key
 
     eval_env = gym.make(config.dataset_name)
     eval_env.seed(config.eval_seed)
@@ -493,18 +493,87 @@ def main(config: Config):
     action_dim = init_action.shape[-1]
     max_action = float(eval_env.action_space.high[0])
 
+    # 알고리즘 판단: FQL 파라미터가 설정되어 있으면 FQL로 판단
+    # (flow_steps가 기본값이 아니거나, q_agg가 설정되어 있으면 FQL)
+    is_fql = hasattr(config, 'flow_steps') and config.flow_steps > 0
+    
     # Create multiple actors
     actors = []
     actor_modules = []
     actor_is_stochastic = []
     actor_is_gaussian = []
     
-    if config.actor_configs is None:
-        config.actor_configs = [{"type": "deterministic"} for _ in range(config.num_actors)]
+    # Actor0 생성
+    if is_fql:
+        # FQL의 경우: StochasticMLP 사용 (GELU activation)
+        actor0_module = StochasticMLP(
+            action_dim=action_dim,
+            max_action=max_action,
+            hidden_dim=config.hidden_dim,
+            layernorm=config.actor_ln,
+            n_hiddens=config.actor_n_hiddens,
+            activation="gelu",  # FQL: GELU activation
+        )
+        # StochasticMLP 초기화: state와 z 필요
+        init_z = jnp.zeros((1, action_dim), dtype=init_state.dtype)
+        actor0_params = actor0_module.init(actor_keys[0], init_state, init_z)
+        actor0_target_params = actor0_module.init(actor_keys[0], init_state, init_z)
+    else:
+        # ReBRAC의 경우: DeterministicMLP 사용
+        actor0_module = DeterministicMLP(
+            action_dim=action_dim,
+            max_action=max_action,
+            hidden_dim=config.hidden_dim,
+            layernorm=config.actor_ln,
+            n_hiddens=config.actor_n_hiddens,
+        )
+        actor0_params = actor0_module.init(actor_keys[0], init_state)
+        actor0_target_params = actor0_module.init(actor_keys[0], init_state)
     
-    for i in range(config.num_actors):
+    actor0_is_stochastic = getattr(actor0_module, 'is_stochastic', False)
+    actor0_is_gaussian = getattr(actor0_module, 'is_gaussian', False)
+    
+    # Actor0 타입 추론
+    # FQLFlowPolicy는 FQL 알고리즘에서 사용되지만, 타입은 deterministic으로 분류
+    if isinstance(actor0_module, FQLFlowPolicy):
+        actor0_type = "deterministic"  # FQLFlowPolicy는 deterministic으로 분류
+    elif isinstance(actor0_module, GaussianMLP):
+        actor0_type = "gaussian"
+    elif isinstance(actor0_module, TanhGaussianMLP):
+        actor0_type = "tanh_gaussian"
+    elif isinstance(actor0_module, StochasticMLP):
+        actor0_type = "stochastic"
+    else:
+        actor0_type = "deterministic"
+    
+    # actor_configs가 None이거나 부족하면 Actor0 타입으로 채우기
+    if config.actor_configs is None:
+        config.actor_configs = [{"type": actor0_type} for _ in range(config.num_actors)]
+    else:
+        # 부족한 경우 Actor0 타입으로 채우기
+        while len(config.actor_configs) < config.num_actors:
+            config.actor_configs.append({"type": actor0_type})
+        config.actor_configs = config.actor_configs[:config.num_actors]
+    
+    # Actor0의 타입을 확실히 설정 (config.actor_configs[0]에 명시적으로 설정)
+    config.actor_configs[0]["type"] = actor0_type
+    
+    # Actor0 추가
+    actor0 = ActorTrainState.create(
+        apply_fn=actor0_module.apply,
+        params=actor0_params,
+        target_params=actor0_target_params,
+        tx=optax.adam(learning_rate=config.actor_learning_rate),
+    )
+    actors.append(actor0)
+    actor_modules.append(actor0_module)
+    actor_is_stochastic.append(actor0_is_stochastic)
+    actor_is_gaussian.append(actor0_is_gaussian)
+    
+    # Actor1+ 생성
+    for i in range(1, config.num_actors):
         actor_config = config.actor_configs[i]
-        actor_type = actor_config.get("type", "deterministic")  # "tanh_gaussian", "gaussian", "stochastic", or "deterministic"
+        actor_type = actor_config.get("type", actor0_type)  # 기본값은 Actor0 타입
         
         if actor_type == "gaussian":
             # Gaussian: mean에 tanh 적용된 상태에서 샘플링
@@ -556,6 +625,53 @@ def main(config: Config):
         is_stochastic = getattr(actor_module, 'is_stochastic', False)
         is_gaussian = getattr(actor_module, 'is_gaussian', False)
         
+        # Actor1+이고 Actor0와 같은 타입이면 params 복사 (PyTorch 버전과 동일)
+        if i > 0 and actor_type == actor0_type:
+            # 같은 타입이면 Actor0의 params 복사
+            try:
+                actor0_params = actors[0].params
+                # FrozenDict를 unfreeze()로 변환 (FrozenDict인 경우만)
+                if isinstance(actor0_params, FrozenDict):
+                    actor0_dict = actor0_params.unfreeze()
+                else:
+                    actor0_dict = dict(actor0_params)
+                
+                if isinstance(init_params, FrozenDict):
+                    init_dict = init_params.unfreeze()
+                else:
+                    init_dict = dict(init_params)
+                
+                # 공통 키만 복사 (shape이 같은 경우만)
+                def copy_params_recursive(src_dict, tgt_dict):
+                    """Recursively copy params with shape checking"""
+                    result = {}
+                    for key in tgt_dict.keys():
+                        if key in src_dict:
+                            src_val = src_dict[key]
+                            tgt_val = tgt_dict[key]
+                            
+                            if isinstance(tgt_val, dict) and isinstance(src_val, dict):
+                                # Nested dict (예: params['Dense_0']['kernel'])
+                                result[key] = copy_params_recursive(src_val, tgt_val)
+                            elif hasattr(tgt_val, 'shape') and hasattr(src_val, 'shape'):
+                                # JAX array - check shape
+                                if src_val.shape == tgt_val.shape:
+                                    result[key] = src_val
+                                else:
+                                    result[key] = tgt_val
+                            else:
+                                result[key] = tgt_val
+                        else:
+                            result[key] = tgt_val
+                    return result
+                
+                new_params_dict = copy_params_recursive(actor0_dict, init_dict)
+                init_params = FrozenDict(new_params_dict)
+                init_target_params = FrozenDict(new_params_dict)
+            except Exception as e:
+                # 복사 실패 시 초기화된 params 사용
+                print(f"Warning: Failed to copy Actor0 params to Actor{i}: {e}", flush=True)
+        
         actor = ActorTrainState.create(
             apply_fn=actor_module.apply,
             params=init_params,
@@ -582,57 +698,96 @@ def main(config: Config):
         tx=optax.adam(learning_rate=config.critic_learning_rate),
     )
 
-    # Gaussian과 Stochastic 구분
-    use_gaussian = any(actor_is_gaussian)
-    
-    if use_gaussian:
-        # Gaussian: closed form W2
-        update_multi_actor_partial = partial(
-            update_multi_actor_gaussian,
-            actor_modules=actor_modules,
-            actor_is_gaussian=actor_is_gaussian,
-            w2_weights=config.w2_weights,
-            beta=config.actor_bc_coef,
+    # 알고리즘 객체 생성
+    if is_fql:
+        # Flow policy 생성 (actor_bc_flow, 별도 네트워크, GELU activation)
+        flow_policy = ActorVectorField(
+            hidden_dim=config.hidden_dim,
+            action_dim=action_dim,
+            n_hiddens=config.actor_n_hiddens,
+            layer_norm=config.actor_ln,
+            activation="gelu",  # FQL: GELU activation
+        )
+        # Flow policy 초기화: state, action, time 필요
+        init_noise_flow = jnp.zeros((1, action_dim), dtype=init_state.dtype)
+        init_time_flow = jnp.zeros((1, 1), dtype=init_state.dtype)
+        flow_policy_params = flow_policy.init(actor_keys[0], init_state, init_noise_flow, init_time_flow)
+        flow_policy_target_params = flow_policy.init(actor_keys[0], init_state, init_noise_flow, init_time_flow)
+        
+        # Flow policy train state 생성
+        flow_policy_state = ActorTrainState.create(
+            apply_fn=flow_policy.apply,
+            params=flow_policy_params,
+            target_params=flow_policy_target_params,
+            tx=optax.adam(learning_rate=config.actor_learning_rate),
+        )
+        
+        algorithm = FQLAlgorithm(
             gamma=config.gamma,
             tau=config.tau,
-            policy_noise=config.policy_noise,
-            noise_clip=config.noise_clip,
-            normalize_q=config.normalize_q,
+            q_agg=config.q_agg,
+            normalize_q_loss=config.normalize_q_loss,
+            alpha=config.alpha,
+            flow_steps=config.flow_steps,
+            flow_policy=flow_policy,
         )
     else:
-        # Stochastic: Sinkhorn
-        update_multi_actor_partial = partial(
-            update_multi_actor_stochastic,
-            actor_modules=actor_modules,
-            actor_is_stochastic=actor_is_stochastic,
-            w2_weights=config.w2_weights,
-            sinkhorn_K=config.sinkhorn_K,
-            sinkhorn_blur=config.sinkhorn_blur,
-            beta=config.actor_bc_coef,
+        flow_policy_state = None
+        algorithm = ReBRACAlgorithm(
+            actor_bc_coef=config.actor_bc_coef,  # actor loss에 사용
+            critic_bc_coef=config.critic_bc_coef,  # critic 업데이트에 사용
             gamma=config.gamma,
             tau=config.tau,
             policy_noise=config.policy_noise,
             noise_clip=config.noise_clip,
             normalize_q=config.normalize_q,
         )
+    
+    # 통합된 update_multi_actor 사용 (PyTorch 버전과 구조 일치)
+    # flow_policy_state는 partial에 고정하지 않고 매 스텝 carry에서 전달 (업데이트 반영을 위해)
+    update_multi_actor_partial = partial(
+        update_multi_actor,
+        algorithm=algorithm,
+        actor_modules=actor_modules,
+        actor_is_gaussian=actor_is_gaussian,
+        actor_is_stochastic=actor_is_stochastic,
+        w2_weights=config.w2_weights,
+        sinkhorn_K=config.sinkhorn_K,
+        sinkhorn_blur=config.sinkhorn_blur,
+        actor_bc_coef=config.actor_bc_coef,  # actor loss에 사용
+        critic_bc_coef=config.critic_bc_coef,  # critic 업데이트에 사용 (algorithm 객체에도 저장됨)
+        gamma=config.gamma,
+        tau=config.tau,
+        policy_noise=config.policy_noise,
+        noise_clip=config.noise_clip,
+        normalize_q=config.normalize_q,
+        policy_freq=getattr(config, "policy_freq", 1),
+    )
 
     def loop_update_step(i: int, carry: Dict) -> Dict:
         key, batch_key = jax.random.split(carry["key"])
         batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
 
-        key, new_actors, new_critic, new_metrics = update_multi_actor_partial(
+        key, new_actors, new_critic, new_metrics, new_flow_policy_state = update_multi_actor_partial(
             key=key,
             actors=carry["actors"],
             critic=carry["critic"],
             batch=batch,
             metrics=carry["metrics"],
+            total_steps=carry["total_steps"],
+            flow_policy_state=carry.get("flow_policy_state", None),  # FQL용: carry에서 최신 state 전달
         )
+
+        # total_steps 증가
+        total_steps = carry["total_steps"] + 1
 
         carry.update({
             "key": key,
             "actors": new_actors,
             "critic": new_critic,
             "metrics": new_metrics,
+            "total_steps": total_steps,
+            "flow_policy_state": new_flow_policy_state,  # FQL용
         })
         return carry
 
@@ -650,6 +805,8 @@ def main(config: Config):
         "actors": actors,
         "critic": critic,
         "buffer": buffer,
+        "total_steps": 0,  # 전체 update step 수 추적
+        "flow_policy_state": flow_policy_state,  # FQL용: 초기 flow_policy_state 설정
     }
 
     def make_actor_action_fn(actor_idx: int):
@@ -658,19 +815,56 @@ def main(config: Config):
         is_gaussian = actor_is_gaussian[actor_idx]
         is_stoch = actor_is_stochastic[actor_idx]
         
-        @jax.jit
-        def _action_fn(params: FrozenDict, obs: jax.Array) -> jax.Array:
-            if is_gaussian:
-                # GaussianMLP: use mean
-                mean, _ = actor_module.apply(params, obs)
-                return mean
-            elif is_stoch:
-                # StochasticMLP: use z=0 for deterministic
-                z_zero = jnp.zeros((obs.shape[0], actor_module.action_dim), dtype=obs.dtype)
-                return actor_module.apply(params, obs, z_zero)
-            else:
-                # DeterministicMLP: state only
-                return actor_module.apply(params, obs)
+        # FQLFlowPolicy인지 확인
+        is_fql_flow = isinstance(actor_module, FQLFlowPolicy)
+        
+        # StochasticMLP의 경우 key를 내부에서 생성 (evaluation용)
+        if is_stoch:
+            base_key = jax.random.PRNGKey(42)  # Evaluation용 base key
+            
+            @jax.jit
+            def _action_fn(params: FrozenDict, obs: jax.Array) -> jax.Array:
+                # obs가 1D인 경우 2D로 변환
+                if obs.ndim == 1:
+                    obs = obs[None, :]  # [1, state_dim]
+                    squeeze_output = True
+                else:
+                    squeeze_output = False
+                
+                # StochasticMLP: z를 샘플링 (one-step BC policy)
+                # obs 기반으로 key 생성 (deterministic evaluation을 위해)
+                obs_hash = jnp.sum(obs).astype(jnp.uint32)
+                key = jax.random.fold_in(base_key, obs_hash)
+                z = jax.random.normal(key, (obs.shape[0], actor_module.action_dim))
+                actions = actor_module.apply(params, obs, z)
+                
+                if squeeze_output:
+                    actions = actions.squeeze(0)  # [action_dim]
+                return actions
+        else:
+            @jax.jit
+            def _action_fn(params: FrozenDict, obs: jax.Array) -> jax.Array:
+                # obs가 1D인 경우 2D로 변환
+                if obs.ndim == 1:
+                    obs = obs[None, :]  # [1, state_dim]
+                    squeeze_output = True
+                else:
+                    squeeze_output = False
+                
+                if is_fql_flow:
+                    # FQLFlowPolicy: deterministic_actions 메서드 사용
+                    actions = actor_module.deterministic_actions(params, obs)
+                elif is_gaussian:
+                    # GaussianMLP: use mean
+                    mean, _ = actor_module.apply(params, obs)
+                    actions = mean
+                else:
+                    # DeterministicMLP: state only
+                    actions = actor_module.apply(params, obs)
+                
+                if squeeze_output:
+                    actions = actions.squeeze(0)  # [action_dim]
+                return actions
         
         return _action_fn
 
@@ -699,12 +893,17 @@ def main(config: Config):
         
         # Log mean over epoch for each metric
         mean_metrics = update_carry["metrics"].compute()
-        wandb.log(
-            {"epoch": epoch, **{f"POGO_Multi_JAX/{k}": v for k, v in mean_metrics.items()}}
-        )
+        total_steps = update_carry["total_steps"]
+        
+        if config.use_wandb:
+            wandb.log(
+                {"epoch": epoch, "total_steps": total_steps, **{f"POGO_Multi_JAX/{k}": v for k, v in mean_metrics.items()}}
+            )
 
-        if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
+        # eval_freq는 update step 기준 (PyTorch 버전과 동일)
+        if total_steps % config.eval_freq == 0 or (epoch == config.num_epochs - 1):
             # Evaluate each actor
+            actor_results = []
             for actor_idx in range(config.num_actors):
                 action_fn = make_actor_action_fn(actor_idx)
                 eval_returns = evaluate(
@@ -715,16 +914,39 @@ def main(config: Config):
                     seed=config.eval_seed,
                 )
                 normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        f"eval/actor_{actor_idx}_return_mean": np.mean(eval_returns),
-                        f"eval/actor_{actor_idx}_return_std": np.std(eval_returns),
-                        f"eval/actor_{actor_idx}_normalized_score_mean": np.mean(normalized_score),
-                        f"eval/actor_{actor_idx}_normalized_score_std": np.std(normalized_score),
-                    }
-                )
+                raw_avg = float(np.mean(eval_returns))
+                norm_score = float(np.mean(normalized_score))
+                raw_std = float(np.std(eval_returns))
+                norm_std = float(np.std(normalized_score))
+                
+                actor_results.append({
+                    "raw_avg": raw_avg,
+                    "raw_std": raw_std,
+                    "norm_score": norm_score,
+                    "norm_std": norm_std,
+                })
+                
+                # wandb 로깅
+                if config.use_wandb:
+                    wandb.log(
+                        {
+                            f"eval/actor_{actor_idx}/score": norm_score,
+                            f"eval/actor_{actor_idx}/raw_score": raw_avg,
+                            f"eval/actor_{actor_idx}/std": norm_std,
+                        },
+                        step=total_steps,
+                    )
+            
+            # 평가 결과를 한 번에 출력 (PyTorch 버전과 동일한 형식)
+            print("---------------------------------------", flush=True)
+            print(f"[Training] Time steps: {total_steps}", flush=True)
+            print(f"Evaluation over {config.eval_episodes} episodes:", flush=True)
+            for actor_idx in range(config.num_actors):
+                r = actor_results[actor_idx]
+                print(f"  Actor {actor_idx} - Raw: {r['raw_avg']:.3f} ± {r['raw_std']:.3f}, D4RL score: {r['norm_score']:.1f} ± {r['norm_std']:.1f}", flush=True)
+            print("---------------------------------------", flush=True)
 
 
 if __name__ == "__main__":
+    _parse_args_with_no_wandb()
     main()
