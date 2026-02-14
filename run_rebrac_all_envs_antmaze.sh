@@ -62,10 +62,17 @@ for env in "${ENVIRONMENTS[@]}"; do
         exit 1
     fi
     
+    num_actors=$(grep "^num_actors:" "$config_file" 2>/dev/null | sed 's/num_actors: *//' | tr -d ' ')
+    actor_type=$(grep -A 50 "actor_configs:" "$config_file" 2>/dev/null | grep "type:" | head -1 | sed 's/.*type: *\([a-z_]*\).*/\1/' | tr -d ' ')
+    num_actors=${num_actors:-3}
+    actor_type=${actor_type:-gaussian}
+    w2weight=$(grep "w2_weights:" "$config_file" 2>/dev/null | sed 's/.*\[ *\([0-9]*\)\.*.*/\1/' | tr -d ' ')
+    w2weight=${w2weight:-10}
+
     for SEED in "${SEEDS[@]}"; do
         log_dir="${LOG_DIR}/${env_clean}/seed${SEED}"
         mkdir -p "$log_dir"
-        log_file="${log_dir}/$(date +%Y%m%d_%H%M%S).log"
+        log_file="${log_dir}/${env_clean}_rebrac_${actor_type}_${num_actors}_${w2weight}_${SEED}.log"
         
         # 임시 config 파일 생성 (seed, dataset_name, w2_weights 설정)
         TEMP_CONFIG="/tmp/pogo_rebrac_${env_clean}_seed${SEED}.yaml"
